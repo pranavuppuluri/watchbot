@@ -1,0 +1,7 @@
+.env
+output/
+listener/auth/
+listener/node_modules/
+listener/config.json
+listener/groups.json
+__pycache__/
