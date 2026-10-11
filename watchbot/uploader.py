@@ -7,8 +7,8 @@ For every product in the catalog that isn't on the website yet:
   3. reply to that preview with  yes  (or  yes 4500  to set the price,  no  to skip)
   4. approved products are uploaded and published, and a confirmation with the link is sent
 
-It also marks an uploaded watch out of stock when the dealer says it's sold (and back in stock
-if it becomes available again).
+It also keeps uploaded watches in step with the dealer: out of stock when sold (back in stock if
+available again), and the new price when the dealer changes it, unless you set the price yourself.
 
 State lives in uploads.json next to catalog.json. Settings come from .env:
   WC_URL, WP_USER, WP_APP_PASSWORD           the site and a WordPress application password
@@ -338,7 +338,7 @@ class Uploader:
                               {"key": "_watchbot_dealer_price", "value": str(rec.get("price") or "")}],
             })
         s.update(state="uploaded", wc_id=product["id"], url=product.get("permalink"), at=time.time(),
-                 synced_status=rec.get("status"))
+                 synced_status=rec.get("status"), dealer_price=rec.get("price"))
         s.pop("error", None)
         print(f"  ↑ uploaded: {title} -> {product.get('permalink')}")
         self._send(f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
@@ -352,6 +352,24 @@ class Uploader:
         word = "marked sold (out of stock)" if status == "sold" else "back in stock"
         print(f"  ~ {rec['title']}: {word}")
         self._send(f"{rec['title']} {word} on the website.")
+
+    def _sync_price(self, rec: dict, s: dict) -> None:
+        """Dealer re-posted or replied with a new price: follow it, unless you set the price yourself."""
+        dealer = rec.get("price")
+        known = s.setdefault("dealer_price", dealer)
+        if not dealer or dealer == known:
+            return
+        followed = known and s["price"] == site_price(known)  # False after a "yes 4500" override
+        s["dealer_price"] = dealer
+        if followed:
+            old, new = s["price"], site_price(dealer)
+            self.woo.update(s["wc_id"], {"regular_price": str(new)})
+            s["price"] = new
+            print(f"  ~ {rec['title']}: price {old} -> {new}")
+            self._send(f"Price updated on the website: {rec['title']}\n₹{old:,} → ₹{new:,} (dealer changed it)")
+        else:
+            self._send(f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
+                       f"The website still shows your price, ₹{s['price']:,}.")
 
     # ------------------------------------------------------------- loop
     def tick(self) -> None:
@@ -374,6 +392,7 @@ class Uploader:
                     self._upload(rec, s)
                 elif s["state"] == "uploaded":
                     self._sync_status(rec, s)
+                    self._sync_price(rec, s)
             except Exception as e:
                 fails = s.get("fails", 0) + 1
                 s.update(error=str(e)[:300], fails=fails, retry_at=time.time() + min(60 * 2 ** fails, 3600))

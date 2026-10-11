@@ -99,7 +99,7 @@ Each new watch is sent to you on WhatsApp first; nothing goes on the site until 
    - `yes`: upload it now, at the price shown
    - `yes 4500`: upload at ₹4,500
    - `no`: skip it
-5. Approved watches are published with square photos (same size, location data removed), title, price, brand category, a spec list and stock of 1, and you get the link back. When the dealer marks a watch sold, it's set out of stock on the site.
+5. Approved watches are published with square photos (same size, location data removed), title, price, brand category, a spec list and stock of 1, and you get the link back. When the dealer marks a watch sold, it's set out of stock on the site; when the dealer changes a price, the site follows (unless you set that watch's price yourself with `yes <price>`, then you're just told).
 
 `python -m watchbot upload --dry-run` shows what would be sent without sending or uploading anything. Upload progress is kept in `<OUT>/uploads.json`.
 
