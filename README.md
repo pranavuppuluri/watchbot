@@ -42,7 +42,7 @@ All three inputs feed the same pipeline (`watchbot/pipeline.py`), so a watch sav
 | Route | How | Trade-off |
 |---|---|---|
 | Chat export | WhatsApp's built-in *Export chat → Include media*. `parse_export.py` reads the `.txt` plus the photos. | Zero risk, but manual and not real-time. |
-| Live listener | [Baileys](https://baileys.wiki) links a spare number to the PC as a "linked device" (like WhatsApp Web) and saves every group message as it arrives. Read-only: it never sends anything. | Fully automatic, but unofficial: the linked number can be banned, so use a spare SIM. |
+| Live listener | [Baileys](https://baileys.wiki) links a spare number to the PC as a "linked device" (like WhatsApp Web) and saves every group message as it arrives. It never posts in the dealer's group; it only sends upload previews to your approval chat. | Fully automatic, but unofficial: the linked number can be banned, so use a spare SIM. |
 | Forwarding bot | Official Cloud API webhook (`bot.py`). You forward the dealer's posts to the bot, and it replies with what it saved. | Official and safe, but forwarding is manual and it needs a Meta app and a public URL (ngrok). |
 
 **Parsing exports.** Android and iPhone exports use different line formats (`12/03/2026, 10:15 pm - Name: …` and `[12/03/26, 10:15:30 PM] Name: …`), contain invisible direction marks and narrow no-break spaces, and follow the phone's date locale. The parser strips the invisible characters, detects day-first or month-first from the data, and joins multi-line messages and photo captions.
@@ -84,9 +84,24 @@ Optional: put `ANTHROPIC_API_KEY=...` in a `.env` file for AI extraction. Withou
 1. Add a spare number to the dealer's group.
 2. `cd listener && node index.mjs`. On the spare phone, go to WhatsApp → Settings → Linked devices → Link a device and scan the QR code. It then lists your groups.
 3. `node index.mjs --group "<group name>"`. The group is remembered from then on.
-4. Every day: run `start-bot.bat` (Windows), which opens the listener and the saver. Set `SELLER=` inside it to save only the dealer's posts.
+4. Every day: run `start-bot.bat` (Windows). It starts a watchdog that runs the listener and the saver in one window and restarts either if it stops (or if the listener stops checking in for 5 minutes). Settings live in `.env` (copy `.env.example`): `WATCHBOT_OUT` for the folder, `WATCHBOT_SELLER` to save only the dealer's posts. A log is kept in `<WATCHBOT_OUT>/logs/`.
 
 Posts are saved 3 minutes after the dealer stops posting. Open WhatsApp on the spare phone every ~14 days so the link doesn't expire. `listener/auth/` is the login session: keep it private.
+
+### Uploading to the website (WooCommerce)
+
+Each new watch is sent to you on WhatsApp first; nothing goes on the site until you say yes.
+
+1. WordPress admin → Users → Profile → **Application Passwords** → name it `watchbot` → Add. Copy `.env.example` to `.env` and fill in `WC_URL`, `WP_USER` and `WP_APP_PASSWORD`. Check it with `python -m watchbot upload --check`.
+2. Set your markup in `.env` (`MARKUP_PERCENT`, `MARKUP_FLAT`, `PRICE_ROUND`).
+3. In `.env` set `WATCHBOT_UPLOAD=on`, and `WATCHBOT_APPROVAL` to `self` (the spare number's own "Message yourself" chat) or the name of a group you share with the spare number.
+4. For every new watch you get the cover photo, title, price and details. **Reply** to it:
+   - `yes`: upload it now, at the price shown
+   - `yes 4500`: upload at ₹4,500
+   - `no`: skip it
+5. Approved watches are published with square photos (same size, location data removed), title, price, brand category, a spec list and stock of 1, and you get the link back. When the dealer marks a watch sold, it's set out of stock on the site.
+
+`python -m watchbot upload --dry-run` shows what would be sent without sending or uploading anything. Upload progress is kept in `<OUT>/uploads.json`.
 
 ### 3. Forwarding bot (official Meta Cloud API)
 
@@ -105,6 +120,8 @@ Posts are saved 3 minutes after the dealer stops posting. Open WhatsApp on the s
 | `output/catalog.csv` | one row per watch, opens in Excel |
 | `output/catalog.json` | the same data, for a store uploader |
 | `output/state.json` | photo fingerprints for duplicate checks |
+| `output/products/<…>/web/` | square, resized photos made for the website |
+| `output/uploads.json` | which watches were previewed, approved, uploaded or skipped |
 
 ## Project layout
 
@@ -116,15 +133,16 @@ watchbot/
   store.py          product folders, catalog, duplicate fingerprints, history
   pipeline.py       one group → added / updated / duplicate (shared by all inputs)
   watch.py          live mode: processes what the listener saves
+  uploader.py       WhatsApp preview → "yes" → WooCommerce product
+  watchdog.py       runs and restarts the listener, saver and uploader
   bot.py            Meta Cloud API forwarding bot (Flask webhook)
   whatsapp.py       minimal Cloud API client
 listener/
-  index.mjs         Baileys linked-device listener (read-only)
+  index.mjs         Baileys linked-device listener (also sends previews to the approval chat)
 ```
 
 ## Next
 
-- Upload to WooCommerce through its REST API, as drafts for review.
 - Use the photos to help split groups that the text alone can't separate.
 
 ## A note on use

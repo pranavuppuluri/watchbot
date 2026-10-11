@@ -1,0 +1,392 @@
+"""Upload saved watches to WooCommerce after a "yes" on WhatsApp.
+
+For every product in the catalog that isn't on the website yet:
+  1. the photos are squared and resized into products/<id>/web/ (same size, EXIF and GPS stripped)
+  2. a preview (cover photo + title, price, details) is queued in _outbox/; the listener sends it
+     to the approval chat (your own "Message yourself" chat by default)
+  3. reply to that preview with  yes  (or  yes 4500  to set the price,  no  to skip)
+  4. approved products are uploaded and published, and a confirmation with the link is sent
+
+It also marks an uploaded watch out of stock when the dealer says it's sold (and back in stock
+if it becomes available again).
+
+State lives in uploads.json next to catalog.json. Settings come from .env:
+  WC_URL, WP_USER, WP_APP_PASSWORD           the site and a WordPress application password
+  MARKUP_PERCENT, MARKUP_FLAT, PRICE_ROUND   website price = dealer price + markup, rounded up
+  IMAGE_SIZE (1200, max side; never upscaled), IMAGE_MODE (crop|pad), IMAGE_BG (#ffffff)
+"""
+from __future__ import annotations
+
+import html
+import json
+import math
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+
+from .extract import parse_price
+
+SWISS_BRANDS = {"omega", "rolex", "tudor", "longines", "rado", "tag heuer", "oris", "certina", "mido",
+                "favre leuba", "enicar", "west end", "sandoz", "henri sandoz", "roamer", "eterna", "zenith",
+                "breitling", "iwc", "cartier", "jaeger-lecoultre", "hmt swiss", "camy", "titoni", "ernest borel"}
+YES = re.compile(r"^\s*(yes|y|ok|okay|upload|approve|haan|ha)\b[\s,:-]*(?P<price>.*)$", re.I)
+NO = re.compile(r"^\s*(no|n|skip|reject|cancel)\b", re.I)
+
+
+def _env_num(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def site_price(dealer_price: float | None) -> int | None:
+    if not dealer_price:
+        return None
+    price = dealer_price * (1 + _env_num("MARKUP_PERCENT", 0) / 100) + _env_num("MARKUP_FLAT", 0)
+    step = _env_num("PRICE_ROUND", 0)
+    return int(math.ceil(price / step) * step) if step > 0 else int(round(price))
+
+
+def prepare_images(folder: Path, names: list[str]) -> list[Path]:
+    """Square, same-size JPEGs in folder/web/, so the shop grid lines up. Re-used if already made."""
+    from PIL import Image, ImageOps
+
+    size = int(_env_num("IMAGE_SIZE", 1200))
+    mode = os.environ.get("IMAGE_MODE", "crop").lower()
+    bg = os.environ.get("IMAGE_BG", "#ffffff")
+    web = folder / "web"
+    web.mkdir(exist_ok=True)
+    out = []
+    for name in names:
+        src = folder / name
+        dst = web / f"{Path(name).stem}.jpg"
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            out.append(dst)
+            continue
+        try:
+            with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")  # phone photos are often stored sideways
+                if mode == "pad":
+                    side = min(size, max(im.size))
+                    im = ImageOps.pad(im, (side, side), Image.LANCZOS, color=bg)
+                else:  # centre square; never upscale (WhatsApp photos are ~720px)
+                    side = min(size, min(im.size))
+                    im = ImageOps.fit(im, (side, side), Image.LANCZOS, centering=(0.5, 0.5))
+                im.save(dst, "JPEG", quality=85, optimize=True, progressive=True)  # no EXIF: drops GPS
+        except Exception as e:  # videos or broken files are left out
+            print(f"    ! skipped {name}: {e}")
+            continue
+        out.append(dst)
+    return out
+
+
+def clean_description(rec: dict) -> str:
+    """The listing text without the dealer's price, contact details or a repeated title line."""
+    lines = []
+    for ln in (rec.get("description") or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.lower() == (rec.get("title") or "").strip().lower():
+            continue
+        price, raw = parse_price(ln)
+        if raw:
+            ln = ln.replace(raw, "").strip(" :-,")
+        ln = re.sub(r"(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}", "", ln).strip()
+        if ln and not re.fullmatch(r"(?i)(price|rs\.?|inr|₹|dm( for price)?)", ln):
+            lines.append(ln)
+    return "\n".join(lines)
+
+
+def specs(rec: dict) -> list[tuple[str, str]]:
+    yes_no = lambda v: None if v is None else ("Included" if v else "Not included")
+    rows = [
+        ("Brand", rec.get("brand")), ("Model", rec.get("model")), ("Reference", rec.get("reference")),
+        ("Year", rec.get("year")),
+        ("Case size", f"{rec['case_size_mm']} mm" if rec.get("case_size_mm") else None),
+        ("Case material", rec.get("case_material")), ("Dial", rec.get("dial")),
+        ("Strap / bracelet", rec.get("bracelet_strap")),
+        ("Movement", (rec.get("movement") or "").capitalize() or None),
+        ("Condition", rec.get("condition")), ("Box", yes_no(rec.get("box"))), ("Papers", yes_no(rec.get("papers"))),
+        ("Accessories", rec.get("accessories")),
+    ]
+    return [(k, str(v)) for k, v in rows if v]
+
+
+class Woo:
+    def __init__(self):
+        import requests
+        self.base = os.environ.get("WC_URL", "").rstrip("/")
+        user, password = os.environ.get("WP_USER", ""), os.environ.get("WP_APP_PASSWORD", "")
+        if not (self.base and user and password):
+            raise SystemExit("Set WC_URL, WP_USER and WP_APP_PASSWORD in .env (see .env.example).")
+        self.http = requests.Session()
+        self.http.auth = (user, password.replace(" ", ""))
+        self.http.headers["User-Agent"] = "watchbot-uploader"
+        self._cats = None
+
+    def _call(self, method: str, path: str, **kw):
+        r = self.http.request(method, f"{self.base}/wp-json/{path}", timeout=120, **kw)
+        if r.status_code >= 400:
+            try:
+                msg = r.json().get("message", r.text[:200])
+            except ValueError:
+                msg = r.text[:200]
+            raise RuntimeError(f"{method} {path}: {r.status_code} {msg}")
+        return r.json()
+
+    def check(self) -> str:
+        me = self._call("GET", "wp/v2/users/me", params={"context": "edit"})
+        self._call("GET", "wc/v3/products", params={"per_page": 1})
+        return me.get("name") or me.get("slug")
+
+    def category_ids(self, brand: str | None) -> list[int]:
+        if self._cats is None:
+            cats = self._call("GET", "wc/v3/products/categories", params={"per_page": 100})
+            self._cats = {c["name"].lower(): c["id"] for c in cats}
+        b = (brand or "").lower()
+        if b in self._cats:
+            return [self._cats[b]]
+        if b in SWISS_BRANDS and "swiss" in self._cats:
+            return [self._cats["swiss"]]
+        return []
+
+    def upload_image(self, path: Path, alt: str) -> int:
+        media = self._call("POST", "wp/v2/media", data=path.read_bytes(), headers={
+            "Content-Type": "image/jpeg", "Content-Disposition": f'attachment; filename="{path.name}"'})
+        self._call("POST", f"wp/v2/media/{media['id']}", json={"alt_text": alt, "title": alt})
+        return media["id"]
+
+    def find_sku(self, sku: str) -> dict | None:
+        found = self._call("GET", "wc/v3/products", params={"sku": sku, "status": "any"})
+        return found[0] if found else None
+
+    def create(self, data: dict) -> dict:
+        return self._call("POST", "wc/v3/products", json=data)
+
+    def update(self, wc_id: int, data: dict) -> dict:
+        return self._call("PUT", f"wc/v3/products/{wc_id}", json=data)
+
+
+class Uploader:
+    def __init__(self, out_dir: Path, dry_run: bool = False):
+        self.out = Path(out_dir)
+        self.catalog_path = self.out / "catalog.json"
+        self.state_path = self.out / "uploads.json"
+        self.outbox = self.out / "_outbox"
+        self.outbox.mkdir(exist_ok=True)
+        self.sent_log = self.outbox / "sent.jsonl"
+        self.approvals = self.out / "_inbox" / "approvals.jsonl"
+        self.state = json.loads(self.state_path.read_text("utf-8")) if self.state_path.exists() else {}
+        self.state.setdefault("products", {})
+        self.state.setdefault("approvals_offset", 0)
+        self.dry_run = dry_run
+        self.woo = None if dry_run else Woo()
+
+    # ------------------------------------------------------------- bookkeeping
+    def _save(self) -> None:
+        if self.dry_run:
+            return
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state, indent=1, ensure_ascii=False), "utf-8")
+        tmp.replace(self.state_path)
+
+    def _catalog(self) -> dict[str, dict]:
+        if not self.catalog_path.exists():
+            return {}
+        try:
+            return {r["id"]: r for r in json.loads(self.catalog_path.read_text("utf-8"))}
+        except json.JSONDecodeError:
+            return {}  # the saver is mid-write; try again next tick
+
+    def _send(self, text: str, image: Path | None = None) -> str:
+        """Queue a WhatsApp message for the listener. Returns the outbox id."""
+        oid = uuid.uuid4().hex[:12]
+        msg = {"id": oid, "text": text, "image": str(image) if image else None}
+        if self.dry_run:
+            print(f"    [would send] {text.splitlines()[0]}" + (f"  + {image.name}" if image else ""))
+            return oid
+        tmp = self.outbox / f"{oid}.tmp"
+        tmp.write_text(json.dumps(msg, ensure_ascii=False), "utf-8")
+        tmp.replace(self.outbox / f"{oid}.json")  # rename so the listener never reads half a file
+        return oid
+
+    def _sent_ids(self) -> dict[str, str]:
+        """outbox id -> WhatsApp message id, written by the listener after sending."""
+        out = {}
+        if self.sent_log.exists():
+            for line in self.sent_log.read_text("utf-8").splitlines():
+                try:
+                    r = json.loads(line)
+                    out[r["outbox_id"]] = r["wa_id"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        return out
+
+    # ------------------------------------------------------------- steps
+    def _preview(self, rec: dict) -> None:
+        pid = rec["id"]
+        folder = self.out / rec["folder"]
+        photos = prepare_images(folder, rec.get("images") or [])
+        price = site_price(rec.get("price"))
+        lines = [f"*New watch for the website*", f"*{rec['title']}*"]
+        if price:
+            dealer = f" (dealer ₹{rec['price']:,.0f})" if price != rec.get("price") else ""
+            lines.append(f"Price: ₹{price:,}{dealer}")
+        else:
+            lines.append("Price: not found. Reply *yes <price>*, e.g. yes 4500")
+        cats = self.woo.category_ids(rec.get("brand")) if self.woo else []
+        lines.append(f"Brand: {rec.get('brand') or 'unknown'}" + ("" if cats or self.dry_run else " (no matching category)"))
+        lines.append(f"Photos: {len(photos)}")
+        for k, v in [r for r in specs(rec) if r[0] != "Brand"][:4]:
+            lines.append(f"{k}: {v}")
+        desc = clean_description(rec)
+        if desc:
+            lines += ["", desc[:400]]
+        if rec.get("needs_review"):
+            lines += ["", "⚠ Check: " + "; ".join(rec["needs_review"])]
+        if rec.get("extracted_by") == "rules":
+            lines.append("(details read with basic rules, please check)")
+        lines += ["", "Reply to this message: *yes* to upload, *yes 4500* to set the price, *no* to skip.", f"#{pid}"]
+        oid = self._send("\n".join(lines), photos[0] if photos else None)
+        self.state["products"][pid] = {"state": "previewed", "outbox_id": oid, "price": price, "at": time.time()}
+        print(f"  ? preview sent: {rec['title']}" + (f" ₹{price:,}" if price else " (no price)"))
+
+    def _read_approvals(self) -> list[dict]:
+        if not self.approvals.exists():
+            return []
+        with open(self.approvals, "rb") as f:
+            f.seek(self.state["approvals_offset"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1
+        self.state["approvals_offset"] += end
+        out = []
+        for line in data[:end].decode("utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def _apply_approvals(self, catalog: dict[str, dict]) -> None:
+        replies = self._read_approvals()
+        if not replies:
+            return
+        sent = self._sent_ids()
+        by_wa = {sent.get(s.get("outbox_id")): pid for pid, s in self.state["products"].items()}
+        waiting = sorted((s["at"], pid) for pid, s in self.state["products"].items() if s["state"] == "previewed")
+        for r in replies:
+            text = (r.get("text") or "").strip()
+            pid = by_wa.get(r.get("quoted_id")) if r.get("quoted_id") else None
+            if not pid:
+                tag = re.search(r"#(\d{8}-[a-z0-9-]+)", text)  # "yes #20261006-seiko-6309" also works
+                pid = tag.group(1) if tag else (waiting[-1][1] if waiting and not r.get("quoted_id") else None)
+            s = self.state["products"].get(pid or "")
+            if not s or s["state"] not in ("previewed", "skipped"):
+                continue
+            title = catalog.get(pid, {}).get("title", pid)
+            if NO.match(text):
+                s["state"] = "skipped"
+                print(f"  - skipped: {title}")
+                self._send(f"Skipped: {title}")
+            elif m := YES.match(text):
+                extra = re.sub(r"#\S+", "", m.group("price")).strip()
+                if extra:
+                    p, _ = parse_price(extra if re.search(r"(?i)₹|rs|inr|price|\d\s*(k|l|lakh)\b", extra) else f"₹{extra}")
+                    if not p:
+                        self._send(f"Couldn't read the price \"{extra}\" for {title}. Reply again, e.g. yes 4500")
+                        continue
+                    s["price"] = int(p)
+                if not s.get("price"):
+                    self._send(f"{title} has no price. Reply *yes <price>*, e.g. yes 4500")
+                    continue
+                s["state"] = "approved"
+                print(f"  ✓ approved: {title} ₹{s['price']:,}")
+            waiting = [w for w in waiting if w[1] != pid]
+
+    def _upload(self, rec: dict, s: dict) -> None:
+        pid, title = rec["id"], rec["title"]
+        existing = self.woo.find_sku(pid)  # uploaded before a crash? don't create it twice
+        if existing:
+            product = existing
+        else:
+            photos = prepare_images(self.out / rec["folder"], rec.get("images") or [])
+            image_ids = s.setdefault("media_ids", [])
+            for i, p in enumerate(photos[len(image_ids):], len(image_ids) + 1):
+                image_ids.append(self.woo.upload_image(p, f"{title} photo {i}"))
+                self._save()  # keep uploaded media ids so a retry doesn't upload them again
+            rows = specs(rec)
+            desc = clean_description(rec)
+            body = "".join(f"<p>{html.escape(p)}</p>" for p in desc.split("\n") if p)
+            table = "".join(f"<li><strong>{html.escape(k)}:</strong> {html.escape(v)}</li>" for k, v in rows)
+            product = self.woo.create({
+                "name": title,
+                "type": "simple",
+                "status": "publish",
+                "sku": pid,
+                "regular_price": str(s["price"]),
+                "description": body + (f"<ul>{table}</ul>" if table else ""),
+                "short_description": f"<ul>{table}</ul>" if table else "",
+                "categories": [{"id": c} for c in self.woo.category_ids(rec.get("brand"))],
+                "images": [{"id": i} for i in image_ids],
+                "manage_stock": True,
+                "stock_quantity": 0 if rec.get("status") == "sold" else 1,
+                "sold_individually": True,
+                "attributes": [{"name": k, "options": [v], "visible": True} for k, v in rows],
+                "meta_data": [{"key": "_watchbot_id", "value": pid},
+                              {"key": "_watchbot_dealer_price", "value": str(rec.get("price") or "")}],
+            })
+        s.update(state="uploaded", wc_id=product["id"], url=product.get("permalink"), at=time.time(),
+                 synced_status=rec.get("status"))
+        s.pop("error", None)
+        print(f"  ↑ uploaded: {title} -> {product.get('permalink')}")
+        self._send(f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
+
+    def _sync_status(self, rec: dict, s: dict) -> None:
+        status = rec.get("status")
+        if status == s.get("synced_status") or status not in ("sold", "available"):
+            return
+        self.woo.update(s["wc_id"], {"stock_quantity": 0 if status == "sold" else 1})
+        s["synced_status"] = status
+        word = "marked sold (out of stock)" if status == "sold" else "back in stock"
+        print(f"  ~ {rec['title']}: {word}")
+        self._send(f"{rec['title']} {word} on the website.")
+
+    # ------------------------------------------------------------- loop
+    def tick(self) -> None:
+        catalog = self._catalog()
+        products = self.state["products"]
+        for pid, rec in catalog.items():
+            if pid not in products and rec.get("status") != "sold":
+                self._preview(rec)
+                self._save()
+        self._apply_approvals(catalog)
+        self._save()
+        if self.dry_run:
+            return
+        for pid, s in products.items():
+            rec = catalog.get(pid)
+            if not rec:
+                continue
+            try:
+                if s["state"] == "approved" and time.time() >= s.get("retry_at", 0):
+                    self._upload(rec, s)
+                elif s["state"] == "uploaded":
+                    self._sync_status(rec, s)
+            except Exception as e:
+                fails = s.get("fails", 0) + 1
+                s.update(error=str(e)[:300], fails=fails, retry_at=time.time() + min(60 * 2 ** fails, 3600))
+                print(f"  ! {rec['title']}: {e}")
+                if fails == 1:
+                    self._send(f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
+            self._save()
+
+    def run(self, interval: int = 10) -> None:
+        if self.woo:
+            print(f"Uploader connected to {self.woo.base} as {self.woo.check()}")
+        print(f"  Markup {_env_num('MARKUP_PERCENT', 0):g}% + ₹{_env_num('MARKUP_FLAT', 0):g}, "
+              f"images {int(_env_num('IMAGE_SIZE', 1200))}px {os.environ.get('IMAGE_MODE', 'crop')}")
+        while True:
+            self.tick()
+            time.sleep(interval)

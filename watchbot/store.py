@@ -26,8 +26,30 @@ CSV_FIELDS = [
 ]
 
 
+PHOTO_MATCH_BITS = 4  # how many of the 64 fingerprint bits two photos may differ by and still be "the same"
+
+
 def _sha1(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def _fingerprint(path: Path) -> int | None:
+    """Difference hash: survives WhatsApp recompressing or resizing a photo, unlike sha1."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            px = im.convert("L").resize((9, 8), Image.LANCZOS).tobytes()
+    except Exception:  # videos, unreadable files, Pillow missing: fall back to sha1 only
+        return None
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = bits << 1 | (px[row * 9 + col] > px[row * 9 + col + 1])
+    return bits
+
+
+def _close(a: int, b: int) -> bool:
+    return bin(a ^ b).count("1") <= PHOTO_MATCH_BITS
 
 
 def _slug(text: str, limit: int = 50) -> str:
@@ -49,14 +71,31 @@ class Store:
         state = json.loads(self.state_path.read_text("utf-8")) if self.state_path.exists() else {}
         self.image_hashes: dict[str, str] = state.get("image_hashes", {})  # sha1 -> product id
         self.text_hashes: dict[str, str] = state.get("text_hashes", {})
+        self.photo_prints: dict[str, str] = state.get("photo_prints", {})  # fingerprint (hex) -> product id
         self.catalog: list[dict] = json.loads(self.catalog_path.read_text("utf-8")) if self.catalog_path.exists() else []
 
+    def _photo_owner(self, path: Path) -> str | None:
+        """Product that already has this photo (exact file or a recompressed/resized copy)."""
+        pid = self.image_hashes.get(_sha1(path))
+        if pid:
+            return pid
+        fp = _fingerprint(path)
+        if fp is None:
+            return None
+        return next((p for h, p in self.photo_prints.items() if _close(fp, int(h, 16))), None)
+
     def find_duplicate(self, text: str, images: list[Path]) -> str | None:
-        """A re-post counts as a duplicate if every photo was seen before, or (no photos) same text."""
-        hashes = [_sha1(p) for p in images]
-        if hashes and all(h in self.image_hashes for h in hashes):
-            return self.image_hashes[hashes[0]]
-        if not hashes and text and hashlib.sha1(_norm_text(text).encode()).hexdigest() in self.text_hashes:
+        """A re-post is a duplicate if most of its photos belong to one product we have, or (no photos) same text.
+
+        "Most" rather than "all" so a re-post with one new or swapped photo is still caught, while a
+        shared stock shot (box, papers) in an otherwise new listing isn't.
+        """
+        if images:
+            owners = [self._photo_owner(p) for p in images]
+            counts = {p: owners.count(p) for p in set(owners) if p}
+            best = max(counts, key=counts.get, default=None)
+            return best if best and counts[best] * 2 > len(images) else None
+        if text and hashlib.sha1(_norm_text(text).encode()).hexdigest() in self.text_hashes:
             return self.text_hashes[hashlib.sha1(_norm_text(text).encode()).hexdigest()]
         return None
 
@@ -69,12 +108,20 @@ class Store:
         folder = self.products_dir / pid
         folder.mkdir()
 
-        image_names = []
-        for i, src in enumerate(images, 1):
-            name = f"{i:02d}{src.suffix.lower()}"
+        image_names, kept, prints = [], [], []
+        for src in images:
+            sha, fp = _sha1(src), _fingerprint(src)
+            if sha in (_sha1(k) for k in kept) or (fp is not None and any(_close(fp, q) for q in prints)):
+                continue  # the seller sent the same photo twice in this post
+            kept.append(src)
+            name = f"{len(kept):02d}{src.suffix.lower()}"
             shutil.copy2(src, folder / name)
             image_names.append(name)
-            self.image_hashes.setdefault(_sha1(src), pid)
+            self.image_hashes.setdefault(sha, pid)
+            if fp is not None:
+                prints.append(fp)
+                self.photo_prints.setdefault(f"{fp:016x}", pid)
+        images = kept
         if text:
             self.text_hashes.setdefault(hashlib.sha1(_norm_text(text).encode()).hexdigest(), pid)
 
@@ -114,13 +161,15 @@ class Store:
         self.catalog = [r for r in self.catalog if r["id"] != pid]
         self.image_hashes = {h: p for h, p in self.image_hashes.items() if p != pid}
         self.text_hashes = {h: p for h, p in self.text_hashes.items() if p != pid}
+        self.photo_prints = {h: p for h, p in self.photo_prints.items() if p != pid}
         shutil.rmtree(self.products_dir / pid, ignore_errors=True)
         self.save()
         return len(self.catalog) < before
 
     def save(self) -> None:
         self.state_path.write_text(json.dumps(
-            {"image_hashes": self.image_hashes, "text_hashes": self.text_hashes}, indent=1), "utf-8")
+            {"image_hashes": self.image_hashes, "text_hashes": self.text_hashes,
+             "photo_prints": self.photo_prints}, indent=1), "utf-8")
         self.catalog_path.write_text(json.dumps(self.catalog, indent=2, ensure_ascii=False), "utf-8")
         with open(self.out / "catalog.csv", "w", newline="", encoding="utf-8-sig") as f:  # -sig so Excel shows ₹ correctly
             w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")

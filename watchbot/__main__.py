@@ -3,11 +3,14 @@
   python -m watchbot senders  <export.zip>
   python -m watchbot ingest   <export.zip> [--seller "Ravi Watches"] [--dry-run]
   python -m watchbot watch    [--seller "Ravi"]  # live, with listener/index.mjs running
+  python -m watchbot upload   [--once] [--dry-run]  # preview on WhatsApp, upload to WooCommerce on "yes"
+  python -m watchbot run      --out <folder> [--upload]  # watchdog: listener + saver (+ uploader), auto-restart
   python -m watchbot serve    [--port 8000]      # alternative: Meta Cloud API bot, configured in .env
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -83,6 +86,29 @@ def cmd_watch(args) -> None:
     Watcher(Path(args.out), args.seller, args.quiet, args.layout, args.vision).run()
 
 
+def cmd_upload(args) -> None:
+    from .bot import load_env
+    from .uploader import Uploader
+    load_env(Path.cwd() / ".env")
+    up = Uploader(Path(args.out), dry_run=args.dry_run)
+    if args.check:
+        print(f"Connected to {up.woo.base} as {up.woo.check()}")
+    elif args.once or args.dry_run:
+        up.tick()
+    else:
+        up.run()
+
+
+def cmd_run(args) -> None:
+    from .bot import load_env
+    from .watchdog import Watchdog
+    load_env(Path.cwd() / ".env")
+    upload = args.upload or os.environ.get("WATCHBOT_UPLOAD", "").lower() in ("1", "on", "yes", "true")
+    out = args.out or os.environ.get("WATCHBOT_OUT") or "output"
+    sellers = args.seller or [s.strip() for s in os.environ.get("WATCHBOT_SELLER", "").split(",") if s.strip()]
+    Watchdog(Path(out), sellers, upload).run()
+
+
 def cmd_serve(args) -> None:
     from .bot import create_app  # Flask is only needed for the bot
     app = create_app()
@@ -118,6 +144,19 @@ def main() -> None:
     lw.add_argument("--layout", choices=["auto", "after", "before"], default="auto")
     lw.add_argument("--vision", type=int, default=0, metavar="N")
     lw.set_defaults(func=cmd_watch)
+
+    u = sub.add_parser("upload", help="send previews to WhatsApp and upload approved watches to WooCommerce")
+    u.add_argument("--out", default="output", help="output folder (default: ./output)")
+    u.add_argument("--once", action="store_true", help="one pass, then exit")
+    u.add_argument("--dry-run", action="store_true", help="prepare photos and show previews; send and upload nothing")
+    u.add_argument("--check", action="store_true", help="test the WooCommerce login, then exit")
+    u.set_defaults(func=cmd_upload)
+
+    r = sub.add_parser("run", help="watchdog: run listener + saver (+ uploader) and restart them if they stop")
+    r.add_argument("--out", help="output folder (default: WATCHBOT_OUT in .env, else ./output)")
+    r.add_argument("--seller", action="append", help="only this sender: name or number (repeatable; or WATCHBOT_SELLER)")
+    r.add_argument("--upload", action="store_true", help="also run the uploader (or set WATCHBOT_UPLOAD=on in .env)")
+    r.set_defaults(func=cmd_run)
 
     w = sub.add_parser("serve", help="(alternative) official Meta Cloud API bot you forward posts to; see .env.example")
     w.add_argument("--port", type=int, default=8000)

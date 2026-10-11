@@ -111,6 +111,11 @@ _BRANDS = {
     "jaeger": "Jaeger-LeCoultre", "jlc": "Jaeger-LeCoultre", "longines": "Longines", "seiko": "Seiko",
     "grand seiko": "Grand Seiko", "zenith": "Zenith", "vacheron": "Vacheron Constantin", "tissot": "Tissot",
     "oris": "Oris", "rado": "Rado", "chopard": "Chopard", "bvlgari": "Bvlgari", "bulgari": "Bvlgari",
+    "casio": "Casio", "g-shock": "Casio", "citizen": "Citizen", "orient": "Orient", "hmt": "HMT",
+    "titan": "Titan", "timex": "Timex", "allwyn": "Allwyn", "fastrack": "Fastrack", "ricoh": "Ricoh",
+    "favre leuba": "Favre Leuba", "west end": "West End", "enicar": "Enicar", "certina": "Certina",
+    "mido": "Mido", "roamer": "Roamer", "henri sandoz": "Henri Sandoz", "sandoz": "Sandoz",
+    "camy": "Camy", "poljot": "Poljot", "vostok": "Vostok", "raketa": "Raketa", "slava": "Slava",
 }
 _PRICE = re.compile(
     r"(?:₹|rs\.?|inr|price|@)?\s*(?P<num>\d+(?:[.,]\d+)*)\s*(?P<unit>cr|crore|l|lac|lacs|lakh|lakhs|k)?\b",
@@ -128,18 +133,21 @@ def parse_price(text: str) -> tuple[float | None, str | None]:
         if not unit and not prefixed:
             continue  # plain numbers are usually refs, sizes or years
         value = float(raw.replace(",", "")) * _UNITS.get(unit, 1)
-        if 5_000 <= value <= 5e8:
+        if 500 <= value <= 5e8:  # vintage pieces sell from a few hundred rupees
             best = (value, m.group(0).strip())
     return best if best else (None, None)
 
 
 def extract_with_rules(text: str) -> WatchListing:
     low = f" {text.lower()} "
-    brand = next((v for k, v in sorted(_BRANDS.items(), key=lambda kv: -len(kv[0])) if f" {k}" in low or k in low), None)
-    ref = re.search(r"\b(?:ref\.?\s*)?(\d{4,6}[A-Z]{0,4}(?:[-/.]\d+)*)\b", text)
+    # whole words only, so "vintage" isn't TAG Heuer
+    brand = next((v for k, v in sorted(_BRANDS.items(), key=lambda kv: -len(kv[0]))
+                  if re.search(rf"\b{re.escape(k.strip())}\b", low)), None)
+    price, price_text = parse_price(text)
+    no_price = text.replace(price_text, " ") if price_text else text  # "₹7150" isn't a reference
+    ref = re.search(r"\b(?:ref\.?\s*)?(\d{4,6}[A-Z]{0,4}(?:[-/.]\d+)*)\b", no_price)
     year = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text)
     size = re.search(r"\b(\d{2}(?:\.\d)?)\s?mm\b", text, re.IGNORECASE)
-    price, price_text = parse_price(text)
     full_set = bool(re.search(r"full\s*set|\bfs\b|box\s*(?:&|and|\+)\s*papers", low))
     status = "sold" if re.search(r"\bsold\b", low) else "on_hold" if "on hold" in low else "unknown"
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Watch")
