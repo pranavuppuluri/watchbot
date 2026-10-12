@@ -397,6 +397,8 @@ class Uploader:
             return
         followed = known and s["price"] == site_price(known)  # False after a "yes 4500" override
         s["dealer_price"] = dealer
+        if not known or site_price(dealer) == s["price"]:
+            return  # first price seen, or the site already shows it: nothing to tell
         if followed:
             old, new = s["price"], site_price(dealer)
             self.woo.update(s["wc_id"], {"regular_price": str(new)})
