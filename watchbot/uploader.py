@@ -277,13 +277,17 @@ class Uploader:
         print(f"  ? preview sent: {rec['title']}" + (f" ₹{price:,}" if price else " (no price)"))
 
     def _read_approvals(self) -> list[dict]:
-        if not self.approvals.exists():
+        return self._read_new(self.approvals, "approvals_offset")
+
+    def _read_new(self, path: Path, key: str) -> list[dict]:
+        """New whole lines of a .jsonl file since the offset kept in state[key]."""
+        if not path.exists():
             return []
-        with open(self.approvals, "rb") as f:
-            f.seek(self.state["approvals_offset"])
+        with open(path, "rb") as f:
+            f.seek(self.state.setdefault(key, 0))
             data = f.read()
         end = data.rfind(b"\n") + 1
-        self.state["approvals_offset"] += end
+        self.state[key] += end
         out = []
         for line in data[:end].decode("utf-8").splitlines():
             try:
@@ -297,11 +301,21 @@ class Uploader:
         if not replies:
             return
         sent = self._sent_ids()
-        by_wa = {sent.get(s.get("outbox_id")): pid for pid, s in self.state["products"].items()}
+        by_wa = {sent.get(oid): pid for pid, s in self.state["products"].items()
+                 for oid in [s.get("outbox_id"), *s.get("asked_ids", [])]}
         waiting = sorted((s["at"], pid) for pid, s in self.state["products"].items() if s["state"] == "previewed")
         for r in replies:
             text = (r.get("text") or "").strip()
             pid = by_wa.get(r.get("quoted_id")) if r.get("quoted_id") else None
+            stock = re.fullmatch(r"(?i)(?:mark\s+(?:as\s+)?)?(sold|available|unsold|in stock)[.!]?", text)
+            if stock:
+                if not pid and not r.get("quoted_id"):  # unquoted: the latest "already exists" question
+                    asked = [(s["asked_at"], p) for p, s in self.state["products"].items() if s.get("asked_at")]
+                    pid = max(asked)[1] if asked else None
+                if pid:
+                    self._mark(catalog.get(pid, {"title": pid}), self.state["products"][pid],
+                               "sold" if stock.group(1).lower() == "sold" else "available")
+                continue
             if not pid:
                 tag = re.search(r"#(\d{8}-[a-z0-9-]+)", text)  # "yes #20261006-seiko-6309" also works
                 pid = tag.group(1) if tag else (waiting[-1][1] if waiting and not r.get("quoted_id") else None)
@@ -368,6 +382,7 @@ class Uploader:
                 "images": [{"id": i} for i in image_ids],
                 "manage_stock": True,
                 "stock_quantity": 0 if rec.get("status") == "sold" else 1,
+                "backorders": "no",
                 "sold_individually": True,
                 "attributes": [{"name": k, "options": [v], "visible": True} for k, v in rows],
                 "meta_data": [{"key": "_watchbot_id", "value": pid},
@@ -379,12 +394,64 @@ class Uploader:
         print(f"  ↑ uploaded: {title} -> {product.get('permalink')}")
         self._send(f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
 
+    def _set_stock(self, s: dict, status: str) -> None:
+        # out of stock (and no backorders) = WooCommerce hides Add to cart and refuses checkout
+        self.woo.update(s["wc_id"], {"manage_stock": True, "backorders": "no",
+                                     "stock_quantity": 0 if status == "sold" else 1})
+        s["synced_status"] = status
+
+    def _mark(self, rec: dict, s: dict, status: str) -> None:
+        """You replied "sold" / "available" about a watch."""
+        title = rec.get("title", rec.get("id"))
+        s.pop("asked_at", None)
+        s["seen_status"] = rec.get("status")  # the dealer's older status mustn't undo this
+        if s["state"] != "uploaded":
+            if status == "sold" and s["state"] in ("previewed", "approved"):
+                s["state"] = "skipped"
+                self._send(f"OK, {title} is sold. It won't be uploaded.")
+            elif status == "available":
+                self._send(f"{title} isn't on the website yet. Reply *yes* to its preview to upload it.")
+            return
+        if s.get("synced_status") == status:
+            self._send(f"{title} is already marked {status} on the website.")
+            return
+        self._set_stock(s, status)
+        print(f"  ~ {title}: marked {status} by you")
+        self._send(f"✅ {title} marked sold. It can't be added to cart or bought now." if status == "sold"
+                   else f"✅ {title} is back in stock on the website.")
+
+    def _ask_reposts(self, catalog: dict[str, dict]) -> None:
+        """A watch was posted again: say it already exists and offer to mark it sold."""
+        for r in self._read_new(self.out / "_inbox" / "reposts.jsonl", "reposts_offset"):
+            pid, s = r.get("pid"), self.state["products"].get(r.get("pid") or "")
+            rec = catalog.get(pid or "")
+            if not rec or not s:
+                continue
+            title = rec["title"]
+            if s["state"] == "uploaded" and rec.get("status") == "sold" and s.get("synced_status") != "sold":
+                continue  # the post itself says sold; the stock sync handles it and tells you
+            if s.get("synced_status") == "sold" or (s["state"] != "uploaded" and rec.get("status") == "sold"):
+                self._send(f"♻ Already exists: {title}. It's already marked sold.")
+                continue
+            if s["state"] == "uploaded":
+                text = (f"♻ Already exists on the website: *{title}*\n₹{s['price']:,}\n{s.get('url') or ''}\n\n"
+                        "Reply *sold* to mark it sold (it can't be bought after that).")
+            elif s["state"] == "skipped":
+                text = f"♻ Already exists: *{title}*. You skipped it earlier. Reply *sold* if it's sold."
+            else:
+                text = f"♻ Already exists: *{title}*. It's waiting for your *yes*. Reply *sold* if it's sold."
+            s.setdefault("asked_ids", []).append(self._send(text))
+            s["asked_at"] = time.time()
+            print(f"  ♻ already exists: {title}")
+
     def _sync_status(self, rec: dict, s: dict) -> None:
         status = rec.get("status")
+        if status == s.get("seen_status", s.get("synced_status")):
+            return  # the dealer's status hasn't changed since we last looked
+        s["seen_status"] = status
         if status == s.get("synced_status") or status not in ("sold", "available"):
             return
-        self.woo.update(s["wc_id"], {"stock_quantity": 0 if status == "sold" else 1})
-        s["synced_status"] = status
+        self._set_stock(s, status)
         word = "marked sold (out of stock)" if status == "sold" else "back in stock"
         print(f"  ~ {rec['title']}: {word}")
         self._send(f"{rec['title']} {word} on the website.")
@@ -417,6 +484,7 @@ class Uploader:
             if pid not in products and rec.get("status") != "sold":
                 self._preview(rec)
                 self._save()
+        self._ask_reposts(catalog)
         self._apply_approvals(catalog)
         self._save()
         if self.dry_run:

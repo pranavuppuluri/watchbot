@@ -31,6 +31,7 @@ class Watcher:
         self.log = self.inbox / "messages.jsonl"
         self.offset_path = self.inbox / "processed_offset.txt"
         self.map_path = self.inbox / "message_map.json"   # WhatsApp message id -> product id
+        self.reposts = self.inbox / "reposts.jsonl"       # watches posted again, for the uploader to ask about
         self.offset = int(self.offset_path.read_text()) if self.offset_path.exists() else 0
         self.msg_map: dict[str, str] = json.loads(self.map_path.read_text("utf-8")) if self.map_path.exists() else {}
         self.sellers = [s.lower().lstrip("+") for s in sellers or []]
@@ -108,6 +109,9 @@ class Watcher:
         for i, g in enumerate(groups, 1):
             o = process_group(self.store, g, self.use_ai, self.vision)
             print(f"  [{i}/{len(groups)}] {o.line()}")
+            if o.action in ("duplicate", "updated"):
+                with open(self.reposts, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"pid": o.pid, "at": time.time()}) + "\n")
             if o.pid:
                 for m in g.messages:
                     if m.msg_id:

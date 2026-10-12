@@ -180,6 +180,34 @@ class ApprovalFlowTest(unittest.TestCase):
         self.assertEqual(len(again.woo.products), before)
         self.assertEqual(list((self.out / "_outbox").glob("*.json")), [])
 
+    def test_repost_asks_and_sold_reply_stops_sales(self):
+        seiko = "20261006-seiko-6309"
+        self.up.tick()
+        self._deliver_outbox()
+        self._reply("yes 3650", seiko)
+        self.up.tick()
+        s = self.up.state["products"][seiko]
+        product = self.up.woo.products[s["wc_id"]]
+        self.catalog[0]["status"] = "available"  # an older dealer reply
+        self._write_catalog()
+        self.up.tick()
+        self._deliver_outbox()
+
+        with open(self.out / "_inbox" / "reposts.jsonl", "a") as f:  # what the saver writes for a re-post
+            f.write(json.dumps({"pid": seiko, "at": 1}) + "\n")
+        self.up.tick()
+        self.assertIn("Already exists on the website", self._sent_texts()[-1])
+        self._deliver_outbox()
+
+        self._reply("Sold")                       # unquoted: the latest "already exists" question
+        self.up.tick()
+        self.assertEqual((product["stock_quantity"], product["backorders"]), (0, "no"))
+        self.up.tick()                            # the dealer's older "available" doesn't undo it
+        self.assertEqual(product["stock_quantity"], 0)
+        self._reply("available", seiko)
+        self.up.tick()
+        self.assertEqual(product["stock_quantity"], 1)
+
     def _sent_texts(self) -> list[str]:
         texts = [json.loads(o.read_text("utf-8"))["text"] for o in sorted((self.out / "_outbox").glob("*.json"),
                                                                           key=lambda o: o.stat().st_mtime_ns)]
