@@ -18,20 +18,24 @@ watchbot does that copying automatically. It reads the group, works out which ph
 
 ## How it works
 
+```mermaid
+flowchart LR
+    G(["WhatsApp group"]) --> I{"three ways in"}
+    I -- "1 · chat export (.zip)<br/>watchbot ingest" --> P
+    I -- "2 · live listener (Baileys)<br/>watchbot run" --> P
+    I -- "3 · forward to a bot number<br/>watchbot serve" --> P
+    subgraph P["pipeline.py"]
+        direction LR
+        A["parse<br/>who, when, text, photo"] --> B["group<br/>photos + text → one watch"]
+        B --> C["dedupe<br/>photo fingerprints"]
+        C --> D["extract<br/>Claude or regex"]
+        D --> E["store<br/>products/ + catalog"]
+    end
+    E --> Y{"you reply<br/>yes / no<br/>on WhatsApp"}
+    Y -- yes --> W[("WooCommerce")]
 ```
- WhatsApp group
-      │
-      │  three ways in (pick one)
-      ├── 1. Chat export (.zip)          python -m watchbot ingest
-      ├── 2. Live listener (Baileys)     listener/index.mjs  +  python -m watchbot watch
-      └── 3. Forward to a bot number     python -m watchbot serve   (official Meta Cloud API)
-      │
-      ▼
- parse      →  messages: who, when, text, attached photo
- group      →  which photos + text make up one watch
- extract    →  brand, model, ref, year, price… (Claude, or regex fallback)
- store      →  output/products/<date>-<title>/  +  catalog.csv / catalog.json
-```
+
+More diagrams (the processes and files, duplicate checks, the approval flow, upload states, the watchdog) are in **[docs/pipeline.md](docs/pipeline.md)**.
 
 All three inputs feed the same pipeline (`watchbot/pipeline.py`), so a watch saved from an export and the same watch seen live are recognised as one product.
 
@@ -55,7 +59,7 @@ All three inputs feed the same pipeline (`watchbot/pipeline.py`), so a watch sav
 
 **Extracting details** (`extract.py`). Each listing goes to Claude with a Pydantic schema via structured outputs, so the response is always valid, typed JSON. The prompt explains dealer shorthand (DJ = Datejust, FS = full set, 6.5L = ₹6,50,000) and says to leave a field empty rather than guess. Without an API key, a regex fallback still finds the brand, reference, year, case size, box/papers and Indian-format prices (L / lakh / Cr / k / ₹).
 
-**Staying in sync** (`store.py`, `pipeline.py`). Every photo is fingerprinted (SHA-1), so re-importing an overlapping export or a re-post doesn't create duplicates. When the dealer re-posts a watch with a new price, or *replies* to their own post with "sold" / "on hold" / a new price (the live listener records which message a reply quotes), the existing product is updated and the change is logged under `history`. Older posts never overwrite newer data.
+**Staying in sync** (`store.py`, `pipeline.py`). Every photo is fingerprinted twice: an exact SHA-1, and a 64-bit visual hash (dHash) that still matches after WhatsApp recompresses or resizes it. A post counts as a watch we already have when more than half its photos match it, so a re-post with one swapped photo is caught but a shared stock shot isn't. The listener also skips re-downloading media WhatsApp says it already sent, and the uploader checks the SKU before creating a product. When the dealer re-posts a watch with a new price, or *replies* to their own post with "sold" / "on hold" / a new price (the live listener records which message a reply quotes), the existing product is updated and the change is logged under `history`. Older posts never overwrite newer data.
 
 **Testing.** Every input was tested end to end on synthetic data: a fake Android export, simulated Meta webhook calls (signature checks, retries, unknown senders, `undo`), and simulated listener output (seller replies, restarts without re-saving).
 
