@@ -135,6 +135,12 @@ def parse_price(text: str) -> tuple[float | None, str | None]:
         value = float(raw.replace(",", "")) * _UNITS.get(unit, 1)
         if 500 <= value <= 5e8:  # vintage pieces sell from a few hundred rupees
             best = (value, m.group(0).strip())
+    if best is None:
+        # dealers often put the price alone on the last line: "...All original\n3650"
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        m = re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{3,9})(?:\s*/-)?", lines[-1]) if len(lines) > 1 else None
+        if m and not re.fullmatch(r"19[5-9]\d|20[0-3]\d", m.group(1)) and 500 <= float(m.group(1).replace(",", "")) <= 5e8:
+            best = (float(m.group(1).replace(",", "")), lines[-1])
     return best if best else (None, None)
 
 
@@ -145,7 +151,10 @@ def extract_with_rules(text: str) -> WatchListing:
                   if re.search(rf"\b{re.escape(k.strip())}\b", low)), None)
     price, price_text = parse_price(text)
     no_price = text.replace(price_text, " ") if price_text else text  # "₹7150" isn't a reference
-    ref = re.search(r"\b(?:ref\.?\s*)?(\d{4,6}[A-Z]{0,4}(?:[-/.]\d+)*)\b", no_price)
+    # a reference is written as "ref 1234" or next to the name on the title line ("Seiko 6309")
+    title_line = next((ln for ln in no_price.splitlines() if ln.strip()), "")
+    ref = (re.search(r"\bref\.?\s*(\d{4,6}[A-Z]{0,4}(?:[-/.]\d+)*)\b", no_price, re.IGNORECASE)
+           or re.search(r"\b(\d{4,6}[A-Z]{0,4}(?:[-/.]\d+)*)\b", title_line))
     year = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text)
     size = re.search(r"\b(\d{2}(?:\.\d)?)\s?mm\b", text, re.IGNORECASE)
     full_set = bool(re.search(r"full\s*set|\bfs\b|box\s*(?:&|and|\+)\s*papers", low))

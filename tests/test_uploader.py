@@ -22,6 +22,8 @@ class RulesTest(unittest.TestCase):
             ("Casio Mudmaster \nAll original \n₹7150", "Casio", None, 7150),   # price isn't the reference
             ("Nice vintage HMT Janata 1985 Rs 2,800", "HMT", None, 2800),      # "vintage" isn't TAG Heuer
             ("Rolex DJ 41 126334 blue dial\n2021 full set\nPrice 11.75L", "Rolex", "126334", 1_175_000),
+            ("Swiss Adriatica Tank \nAll original \nLarge Size\n3450", None, None, 3450),  # bare last line is the price
+            ("HMT Janata\n1985", "HMT", None, None),                                       # a year isn't a price
         ]
         for text, brand, ref, price in cases:
             got = extract_with_rules(text)
