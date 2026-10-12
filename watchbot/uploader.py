@@ -26,13 +26,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .details import category_for, find_brand, normalise_brand, parse_reply
 from .extract import parse_price
-
-SWISS_BRANDS = {"omega", "rolex", "tudor", "longines", "rado", "tag heuer", "oris", "certina", "mido",
-                "favre leuba", "enicar", "west end", "sandoz", "henri sandoz", "roamer", "eterna", "zenith",
-                "breitling", "iwc", "cartier", "jaeger-lecoultre", "hmt swiss", "camy", "titoni", "ernest borel"}
-YES = re.compile(r"^\s*(yes|y|ok|okay|upload|approve|haan|ha)\b[\s,:-]*(?P<price>.*)$", re.I)
-NO = re.compile(r"^\s*(no|n|skip|reject|cancel)\b", re.I)
 
 
 def _env_num(name: str, default: float) -> float:
@@ -124,7 +119,7 @@ class Woo:
         self.http = requests.Session()
         self.http.auth = (user, password.replace(" ", ""))
         self.http.headers["User-Agent"] = "watchbot-uploader"
-        self._cats = None
+        self._cats, self._cats_at = None, 0.0
 
     def _call(self, method: str, path: str, **kw):
         r = self.http.request(method, f"{self.base}/wp-json/{path}", timeout=120, **kw)
@@ -141,16 +136,13 @@ class Woo:
         self._call("GET", "wc/v3/products", params={"per_page": 1})
         return me.get("name") or me.get("slug")
 
-    def category_ids(self, brand: str | None) -> list[int]:
-        if self._cats is None:
+    def categories(self) -> dict[str, int]:
+        """The shop's product categories, name -> id (re-read every 10 minutes, so new ones show up)."""
+        if self._cats is None or time.time() - self._cats_at > 600:
             cats = self._call("GET", "wc/v3/products/categories", params={"per_page": 100})
-            self._cats = {c["name"].lower(): c["id"] for c in cats}
-        b = (brand or "").lower()
-        if b in self._cats:
-            return [self._cats[b]]
-        if b in SWISS_BRANDS and "swiss" in self._cats:
-            return [self._cats["swiss"]]
-        return []
+            self._cats = {html.unescape(c["name"]): c["id"] for c in cats if c.get("slug") != "uncategorized"}
+            self._cats_at = time.time()
+        return self._cats
 
     def upload_image(self, path: Path, alt: str) -> int:
         media = self._call("POST", "wp/v2/media", data=path.read_bytes(), headers={
@@ -224,6 +216,33 @@ class Uploader:
                     pass
         return out
 
+    def _categories(self) -> dict[str, int]:
+        return self.woo.categories() if self.woo else {}
+
+    def _details(self, rec: dict, s: dict) -> tuple[str | None, str | None, list[str]]:
+        """Brand and category for the shop (your reply wins over what was read from the post),
+        and which of brand / category / price are still missing. Case and typos don't matter."""
+        cats = self._categories()
+        if "brand" in s:
+            brand = s["brand"]  # "" = you said it has no brand
+        else:
+            brand = (normalise_brand(rec.get("brand"), cats)
+                     or find_brand(f"{rec.get('title') or ''}\n{rec.get('description') or ''}", cats))
+        category = s.get("category") or category_for(brand, cats)
+        missing = [name for name, value in (("brand", brand), ("category", category if cats else "-"),
+                                            ("price", s.get("price"))) if value is None or value == 0]
+        return brand, category, missing
+
+    def _ask(self, missing: list[str], title: str, first: bool = False) -> str:
+        example = {"brand": "brand Casio", "category": "category Casio", "price": "4500"}
+        need = ", ".join(missing)
+        lines = [f"*Missing: {need}.*" if first else f"Still need *{need}* for {title}.",
+                 "Reply with them, e.g. *yes " + " ".join(example[m] for m in missing) + "*"
+                 + (" (or *brand none*)" if "brand" in missing else "")]
+        if "category" in missing and self._categories():
+            lines.append("Categories: " + ", ".join(self._categories()))
+        return "\n".join(lines)
+
     # ------------------------------------------------------------- steps
     def _preview(self, rec: dict) -> None:
         pid = rec["id"]
@@ -236,8 +255,10 @@ class Uploader:
             lines.append(f"Price: ₹{price:,}{dealer}")
         else:
             lines.append("Price: not found. Reply *yes <price>*, e.g. yes 4500")
-        cats = self.woo.category_ids(rec.get("brand")) if self.woo else []
-        lines.append(f"Brand: {rec.get('brand') or 'unknown'}" + ("" if cats or self.dry_run else " (no matching category)"))
+        brand, category, missing = self._details(rec, {"price": price})
+        lines.append(f"Brand: {brand or ('none' if brand == '' else '❓ missing')}")
+        if self.woo:
+            lines.append(f"Category: {category or '❓ missing'}")
         lines.append(f"Photos: {len(photos)}")
         for k, v in [r for r in specs(rec) if r[0] != "Brand"][:4]:
             lines.append(f"{k}: {v}")
@@ -248,6 +269,8 @@ class Uploader:
             lines += ["", "⚠ Check: " + "; ".join(rec["needs_review"])]
         if rec.get("extracted_by") == "rules":
             lines.append("(details read with basic rules, please check)")
+        if missing:
+            lines += ["", self._ask(missing, rec["title"], first=True)]
         lines += ["", "Reply to this message: *yes* to upload, *yes 4500* to set the price, *no* to skip.", f"#{pid}"]
         oid = self._send("\n".join(lines), photos[0] if photos else None)
         self.state["products"][pid] = {"state": "previewed", "outbox_id": oid, "price": price, "at": time.time()}
@@ -285,24 +308,36 @@ class Uploader:
             s = self.state["products"].get(pid or "")
             if not s or s["state"] not in ("previewed", "skipped"):
                 continue
-            title = catalog.get(pid, {}).get("title", pid)
-            if NO.match(text):
+            rec = catalog.get(pid, {"title": pid})
+            title = rec.get("title", pid)
+            reply = parse_reply(text, self._categories())
+            if reply["decision"] == "no":
                 s["state"] = "skipped"
+                s.pop("wants_upload", None)
                 print(f"  - skipped: {title}")
                 self._send(f"Skipped: {title}")
-            elif m := YES.match(text):
-                extra = re.sub(r"#\S+", "", m.group("price")).strip()
-                if extra:
-                    p, _ = parse_price(extra if re.search(r"(?i)₹|rs|inr|price|\d\s*(k|l|lakh)\b", extra) else f"₹{extra}")
-                    if not p:
-                        self._send(f"Couldn't read the price \"{extra}\" for {title}. Reply again, e.g. yes 4500")
-                        continue
-                    s["price"] = int(p)
-                if not s.get("price"):
-                    self._send(f"{title} has no price. Reply *yes <price>*, e.g. yes 4500")
-                    continue
-                s["state"] = "approved"
-                print(f"  ✓ approved: {title} ₹{s['price']:,}")
+                waiting = [w for w in waiting if w[1] != pid]
+                continue
+            given = {k: reply[k] for k in ("brand", "category", "price") if reply[k] is not None}
+            s.update(given)
+            if reply["decision"] == "yes":
+                s["wants_upload"] = True
+            notes = []
+            if reply["unknown"]:
+                cats = ", ".join(self._categories()) or "none on the site"
+                notes.append(f"I didn't understand \"{', '.join(reply['unknown'])}\". Categories: {cats}.")
+            if not s.get("wants_upload"):  # details without a yes: note them and wait for the yes
+                got = ", ".join(f"{k} {'none' if v == '' else v}" for k, v in given.items())
+                if got or notes:
+                    self._send("\n".join(([f"Noted for {title}: {got}. Reply *yes* to upload."] if got else []) + notes))
+                continue
+            _, _, missing = self._details(rec, s)
+            if missing:
+                self._send("\n".join(notes + [self._ask(missing, title)]))
+                continue
+            s["state"] = "approved"
+            s.pop("wants_upload", None)
+            print(f"  ✓ approved: {title} ₹{s['price']:,}")
             waiting = [w for w in waiting if w[1] != pid]
 
     def _upload(self, rec: dict, s: dict) -> None:
@@ -316,7 +351,8 @@ class Uploader:
             for i, p in enumerate(photos[len(image_ids):], len(image_ids) + 1):
                 image_ids.append(self.woo.upload_image(p, f"{title} photo {i}"))
                 self._save()  # keep uploaded media ids so a retry doesn't upload them again
-            rows = specs(rec)
+            brand, category, _ = self._details(rec, s)
+            rows = specs({**rec, "brand": brand or None})
             desc = clean_description(rec)
             body = "".join(f"<p>{html.escape(p)}</p>" for p in desc.split("\n") if p)
             table = "".join(f"<li><strong>{html.escape(k)}:</strong> {html.escape(v)}</li>" for k, v in rows)
@@ -328,7 +364,7 @@ class Uploader:
                 "regular_price": str(s["price"]),
                 "description": body + (f"<ul>{table}</ul>" if table else ""),
                 "short_description": f"<ul>{table}</ul>" if table else "",
-                "categories": [{"id": c} for c in self.woo.category_ids(rec.get("brand"))],
+                "categories": [{"id": self._categories()[category]}] if category in self._categories() else [],
                 "images": [{"id": i} for i in image_ids],
                 "manage_stock": True,
                 "stock_quantity": 0 if rec.get("status") == "sold" else 1,

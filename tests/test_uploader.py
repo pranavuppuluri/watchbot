@@ -11,6 +11,7 @@ from unittest import mock
 from PIL import Image
 
 from watchbot import uploader as U
+from watchbot.details import category_for, find_brand, normalise_brand, parse_reply
 from watchbot.extract import extract_with_rules, parse_price
 
 
@@ -49,6 +50,36 @@ class HelpersTest(unittest.TestCase):
             self.assertEqual(Image.open(out[0]).size, (720, 720))
 
 
+CATS = {"Allwyn": 1, "Anomalies": 2, "Casio": 3, "HMT": 4, "Seiko": 5, "Swiss": 6, "Timex": 7, "Titan": 8, "USSR": 9}
+
+
+class DetailsTest(unittest.TestCase):
+    def test_replies_ignore_case_and_typos(self):
+        cases = {
+            "YES": ("yes", None, None, None),
+            "yse 4,500": ("yes", None, None, 4500),
+            "Noo": ("no", None, None, None),
+            "brand omga catagory swis 4.5k": (None, "Omega", "Swiss", 4500),
+            "Yes Brnd: Tag Heuer, CATEGORY swiss, price 12000": ("yes", "Tag Heuer", "Swiss", 12000),
+            "yes sieko 4200": ("yes", "Seiko", "Seiko", 4200),
+            "yes g shock": ("yes", "Casio", None, None),
+            "yes brand none category anomalies 3000": ("yes", "", "Anomalies", 3000),
+            "brand Ajeeth Special": (None, "Ajeeth Special", None, None),
+        }
+        for text, want in cases.items():
+            r = parse_reply(text, CATS)
+            self.assertEqual((r["decision"], r["brand"], r["category"], r["price"]), want, text)
+        self.assertEqual(parse_reply("yes category watches", CATS)["unknown"], ["watches"])
+
+    def test_brand_and_category_from_the_post(self):
+        self.assertEqual(find_brand("New G-shock available 4.2k", CATS), "Casio")
+        self.assertEqual(find_brand("Rolax datejust 36", CATS), "Rolex")
+        self.assertIsNone(find_brand("time only, good condition", CATS))  # "time" is not Timex
+        self.assertEqual(normalise_brand("SEIKO", CATS), "Seiko")
+        self.assertEqual((category_for("Omega", CATS), category_for("Raketa", CATS), category_for("titan", CATS)),
+                         ("Swiss", "USSR", "Titan"))
+
+
 class FakeWoo:
     base = "https://shop.test"
 
@@ -58,8 +89,8 @@ class FakeWoo:
     def check(self):
         return "tester"
 
-    def category_ids(self, brand):
-        return [7] if brand == "Seiko" else []
+    def categories(self):
+        return {"Seiko": 7, "Casio": 8, "Swiss": 9, "Anomalies": 10}
 
     def upload_image(self, path, alt):
         self.media += 1
@@ -146,6 +177,54 @@ class ApprovalFlowTest(unittest.TestCase):
         again.tick()
         self.assertEqual(len(again.woo.products), before)
         self.assertEqual(list((self.out / "_outbox").glob("*.json")), [])
+
+    def _sent_texts(self) -> list[str]:
+        texts = [json.loads(o.read_text("utf-8"))["text"] for o in sorted((self.out / "_outbox").glob("*.json"),
+                                                                          key=lambda o: o.stat().st_mtime_ns)]
+        self._deliver_outbox()
+        return texts
+
+    def test_missing_details_are_asked_for(self):
+        pid = "20261012-very-rare-ajeeth"
+        folder = self.out / "products" / pid
+        folder.mkdir(parents=True)
+        Image.new("RGB", (800, 800), "gray").save(folder / "01.jpg")
+        self.catalog = [{"id": pid, "title": "Very rare Ajeeth", "brand": None, "price": None, "description": "",
+                         "images": ["01.jpg"], "folder": f"products/{pid}"}]
+        self._write_catalog()
+        self.up.tick()
+        preview = self._sent_texts()[0]
+        self.assertIn("Missing: brand, category, price", preview)
+        self.assertIn("Categories: Seiko, Casio, Swiss, Anomalies", preview)
+
+        s = self.up.state["products"][pid]
+        self._reply("Yes", pid)                      # still missing everything: asks again, no upload
+        self.up.tick()
+        self.assertEqual(s["state"], "previewed")
+        self.assertIn("Still need *brand, category, price*", self._sent_texts()[-1])
+
+        self._reply("brnd ajeeth", pid)              # the earlier yes still counts; two left
+        self.up.tick()
+        self.assertIn("Still need *category, price*", self._sent_texts()[-1])
+
+        self._reply("CATAGORY anomalys 3k", pid)     # typo'd keyword and category, short price
+        self.up.tick()
+        self.assertEqual(s["state"], "uploaded")
+        product = self.up.woo.products[s["wc_id"]]
+        self.assertEqual((product["regular_price"], product["categories"]), ("3000", [{"id": 10}]))
+        self.assertIn({"name": "Brand", "options": ["Ajeeth"], "visible": True}, product["attributes"])
+
+    def test_details_without_yes_wait_for_yes(self):
+        seiko = "20261006-seiko-6309"
+        self.up.tick()
+        self._deliver_outbox()
+        self._reply("price 4200", seiko)
+        self.up.tick()
+        self.assertEqual(self.up.state["products"][seiko]["state"], "previewed")
+        self.assertIn("Noted for Seiko 6309: price 4200", self._sent_texts()[-1])
+        self._reply("ok", seiko)
+        self.up.tick()
+        self.assertEqual(self.up.state["products"][seiko]["state"], "uploaded")
 
 
 if __name__ == "__main__":

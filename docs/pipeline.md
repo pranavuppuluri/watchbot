@@ -130,8 +130,8 @@ The states kept in `uploads.json`:
 ```mermaid
 stateDiagram-v2
     [*] --> previewed: new watch in catalog<br/>(not sold)
-    previewed --> approved: "yes" (price known)
-    previewed --> previewed: "yes" with no price<br/>→ asked for one
+    previewed --> approved: "yes" (brand, category,<br/>price all known)
+    previewed --> previewed: brand, category or price missing<br/>→ asked for them (typos and case forgiven)
     previewed --> skipped: "no"
     skipped --> approved: "yes" later
     approved --> approved: upload failed<br/>→ retry with backoff (up to 1 h)
@@ -139,6 +139,8 @@ stateDiagram-v2
     uploaded --> uploaded: dealer says sold / available<br/>→ stock 0 / 1
     uploaded --> uploaded: dealer changes price<br/>→ shop follows, unless you set it
 ```
+
+A reply can carry details in any order and spelling (`yes brand omga catagory swis 4.5k`). Details sent without a "yes" are noted, and the watch waits for the "yes"; a "yes" sent while something is still missing is remembered, so the upload starts as soon as the last missing detail arrives.
 
 Website price = dealer price × (1 + `MARKUP_PERCENT`/100) + `MARKUP_FLAT`, rounded up to `PRICE_ROUND`. If you approved with your own price (`yes 4500`), later dealer price changes are reported to you instead of applied.
 

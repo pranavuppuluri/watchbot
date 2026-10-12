@@ -101,10 +101,12 @@ Each new watch is sent to you on WhatsApp first; nothing goes on the site until 
 1. WordPress admin → Users → Profile → **Application Passwords** → name it `watchbot` → Add. Copy `.env.example` to `.env` and fill in `WC_URL`, `WP_USER` and `WP_APP_PASSWORD`. Check it with `python -m watchbot upload --check`.
 2. Set your markup in `.env` (`MARKUP_PERCENT`, `MARKUP_FLAT`, `PRICE_ROUND`).
 3. In `.env` set `WATCHBOT_UPLOAD=on`, and `WATCHBOT_APPROVAL` to `self` (the spare number's own "Message yourself" chat) or the name of a group you share with the spare number.
-4. For every new watch you get the cover photo, title, price and details. **Reply** to it:
+4. For every new watch you get the cover photo, title, brand, category, price and details. **Reply** to it:
    - `yes`: upload it now, at the price shown
    - `yes 4500`: upload at ₹4,500
    - `no`: skip it
+
+   A watch needs a **brand**, a **category** (one of the shop's categories) and a **price** before it's uploaded. If any are missing, the preview lists them along with the shop's categories, and a `yes` gets a reminder of what's still needed instead of an upload. Send them in one reply or several, in any order: `yes brand Omega category Swiss 4500`, `brand omga`, `catagory swis 4.5k`, `yes sieko`. Case doesn't matter, and small spelling mistakes are fixed (`omga` → Omega, `catagory` → category). `brand none` is accepted for unbranded watches. The brand is also worked out from the post when the dealer only writes a model line or reference (G-Shock, GA-100, SKX007, 6309), and the category follows from the brand (Omega → Swiss, Raketa → USSR).
 5. Approved watches are published with square photos (same size, location data removed), title, price, brand category, a spec list and stock of 1, and you get the link back. When the dealer marks a watch sold, it's set out of stock on the site; when the dealer changes a price, the site follows (unless you set that watch's price yourself with `yes <price>`, then you're just told).
 
 `python -m watchbot upload --dry-run` shows what would be sent without sending or uploading anything. Upload progress is kept in `<OUT>/uploads.json`.
@@ -140,6 +142,7 @@ watchbot/
   pipeline.py       one group → added / updated / duplicate (shared by all inputs)
   watch.py          live mode: processes what the listener saves
   uploader.py       WhatsApp preview → "yes" → WooCommerce product
+  details.py        brand / category matching and reading replies (any case, typos forgiven)
   watchdog.py       runs and restarts the listener, saver and uploader
   bot.py            Meta Cloud API forwarding bot (Flask webhook)
   whatsapp.py       minimal Cloud API client
