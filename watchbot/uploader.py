@@ -160,6 +160,10 @@ class Woo:
     def update(self, wc_id: int, data: dict) -> dict:
         return self._call("PUT", f"wc/v3/products/{wc_id}", json=data)
 
+    def orders(self, modified_after: str) -> list[dict]:
+        """Orders created or changed since modified_after (UTC, ISO 8601)."""
+        return self._call("GET", "wc/v3/orders", params={
+            "modified_after": modified_after, "dates_are_gmt": "true", "per_page": 50})
 
 
 class Uploader:
@@ -486,6 +490,60 @@ class Uploader:
             self._about(s, f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
                        f"The website still shows your price, ₹{s['price']:,}.")
 
+    # ------------------------------------------------------------- orders
+    def _check_orders(self, catalog: dict[str, dict]) -> None:
+        """WhatsApp alert for each new paid / cash-on-delivery order, with a message to forward to the dealer."""
+        if time.time() < self.state.get("orders_next", 0):
+            return
+        self.state["orders_next"] = time.time() + 60
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        since = self.state.setdefault("orders_since", now)  # first run: only orders from now on
+        seen = self.state.setdefault("orders", {})
+        by_sku = {pid: s for pid, s in self.state["products"].items()}
+        for o in sorted(self.woo.orders(since), key=lambda o: o["id"]):
+            oid, status, old = str(o["id"]), o["status"], seen.get(str(o["id"]))
+            if status in ("processing", "on-hold", "completed") and old not in ("processing", "on-hold", "completed"):
+                self._order_alert(o, catalog, by_sku)
+            elif status in ("cancelled", "refunded", "failed") and old in ("processing", "on-hold", "completed"):
+                names = ", ".join(i["name"] for i in o["line_items"])
+                self._send(f"↩ Order #{o['number']} {status}: {names}. WooCommerce puts the stock back.")
+            seen[oid] = status
+        # look back 5 minutes each time, so an order saved while we were polling isn't missed
+        self.state["orders_since"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 300))
+
+    def _order_alert(self, o: dict, catalog: dict[str, dict], by_sku: dict[str, dict]) -> None:
+        total = float(o.get("total") or 0)
+        b, ship = o.get("billing") or {}, o.get("shipping") or {}
+        where = ", ".join(x for x in (ship.get("city") or b.get("city"), ship.get("state") or b.get("state")) if x)
+        paid = "paid" if o.get("date_paid") else "not paid yet"
+        lines = [f"🛒 *New order #{o['number']}*  ₹{total:,.0f}",
+                 f"Status: {o['status'].replace('-', ' ')} ({o.get('payment_method_title') or 'payment'}, {paid})"]
+        mine = []
+        for i in o["line_items"]:
+            lines.append(f"• {i['name']} × {i['quantity']}  ₹{float(i.get('total') or 0):,.0f}")
+            s = by_sku.get(i.get("sku") or "")
+            if s:
+                mine.append((s, catalog.get(i["sku"], {})))
+        name = " ".join(x for x in (b.get("first_name"), b.get("last_name")) if x)
+        lines += ["", f"Customer: {name or 'unknown'}" + (f", {where}" if where else "")]
+        if b.get("phone"):
+            lines.append(f"Phone: {b['phone']}")
+        if mine:
+            lines += ["", "Check with the dealer: forward the message below 👇"]
+        first = mine[0][0] if len(mine) == 1 else None
+        if first:
+            self._about(first, "\n".join(lines))
+        else:
+            self._send("\n".join(lines))
+        for s, rec in mine:
+            s["ordered"] = o["id"]
+            title = rec.get("title") or s.get("title") or "this watch"
+            photos = prepare_images(self.out / rec["folder"], (rec.get("images") or [])[:1]) if rec.get("folder") else []
+            dealer = f" (₹{rec['price']:,.0f})" if rec.get("price") else ""
+            self._send(f"Hi, is the *{title}*{dealer} still available? I'd like to take it.",
+                       photos[0] if photos else None)
+        print(f"  🛒 order #{o['number']} ₹{total:,.0f}")
+
     # ------------------------------------------------------------- loop
     def tick(self) -> None:
         catalog = self._catalog()
@@ -516,6 +574,11 @@ class Uploader:
                 if fails == 1:
                     self._about(s, f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
             self._save()
+        try:
+            self._check_orders(catalog)
+        except Exception as e:  # the site being down mustn't stop uploads
+            print(f"  ! {e}")
+        self._save()
 
     def run(self, interval: int = 10) -> None:
         if self.woo:

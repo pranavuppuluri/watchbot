@@ -86,7 +86,10 @@ class FakeWoo:
     base = "https://shop.test"
 
     def __init__(self):
-        self.products, self.media = {}, 0
+        self.products, self.media, self.order_list = {}, 0, []
+
+    def orders(self, modified_after):
+        return self.order_list
 
     def check(self):
         return "tester"
@@ -224,6 +227,36 @@ class ApprovalFlowTest(unittest.TestCase):
         self._reply("available", seiko)
         self.up.tick()
         self.assertEqual(product["stock_quantity"], 1)
+
+    def _upload_seiko(self) -> dict:
+        seiko = "20261006-seiko-6309"
+        self.up.tick()
+        self._deliver_outbox()
+        self._reply("yes 3650", seiko)
+        self.up.tick()
+        self._deliver_outbox()
+        return self.up.state["products"][seiko]
+
+    def test_order_alert_replies_to_the_watch_and_drafts_a_dealer_message(self):
+        s = self._upload_seiko()
+        self.catalog[0]["price"] = 3200.0
+        self._write_catalog()
+        s["dealer_price"] = 3200.0
+        self.up.state["orders_next"] = 0  # orders are polled once a minute
+        order = {"id": 50, "number": "50", "status": "processing", "total": "3650.00", "date_paid": "2026-10-14T10:00:00",
+                 "payment_method_title": "UPI", "billing": {"first_name": "Asha", "city": "Pune", "phone": "9000000000"},
+                 "shipping": {}, "line_items": [{"name": "Seiko 6309", "quantity": 1, "total": "3650", "sku": "20261006-seiko-6309"}]}
+        self.up.woo.order_list = [order]
+        self.up.tick()
+        alert, dealer = self._sent()[-2:]
+        self.assertIn("New order #50", alert["text"])
+        self.assertEqual(alert["reply_to"], "out:" + s["outbox_id"])      # tags the watch's preview
+        self.assertIn("still available", dealer["text"])
+        self.assertIn("₹3,200", dealer["text"])                         # the dealer's price, not yours
+        self.assertTrue(dealer["image"])
+        self.up.state["orders_next"] = 0
+        self.up.tick()                                                    # same order again: no second alert
+        self.assertFalse(any("New order" in m["text"] for m in self._sent()))
 
     def _sent_texts(self) -> list[str]:
         texts = [json.loads(o.read_text("utf-8"))["text"] for o in sorted((self.out / "_outbox").glob("*.json"),
