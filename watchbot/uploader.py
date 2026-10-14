@@ -9,6 +9,8 @@ For every product in the catalog that isn't on the website yet:
 
 It also keeps uploaded watches in step with the dealer: out of stock when sold (back in stock if
 available again), and the new price when the dealer changes it, unless you set the price yourself.
+It also sends new-order alerts, "still available?" checks and a daily summary. Replies only count
+when they tag one of the bot's messages, and the bot's own messages reply to the one they're about.
 
 State lives in uploads.json next to catalog.json. Settings come from .env:
   WC_URL, WP_USER, WP_APP_PASSWORD           the site and a WordPress application password
