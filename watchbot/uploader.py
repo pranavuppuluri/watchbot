@@ -325,7 +325,7 @@ class Uploader:
             if not pid:
                 tag = re.search(r"#(\d{8}-[a-z0-9-]+)", text)  # "yes #20261006-seiko-6309" also works
                 pid = tag.group(1) if tag and tag.group(1) in self.state["products"] else None
-            stock = re.fullmatch(r"(?i)(?:mark\s+(?:as\s+)?)?(sold|available|unsold|in stock)[.!]?", text)
+            stock = re.fullmatch(r"(?i)(?:mark\s+(?:as\s+)?)?(sold|available|unsold|in stock|keep)[.!]?", text)
             if not pid:
                 if stock or parse_reply(text, self._categories())["decision"] or re.fullmatch(r"\d[\d,.]*k?", text):
                     self._send("Which watch? Reply to (tag) that watch's message, so nothing goes to the wrong one.",
@@ -415,9 +415,10 @@ class Uploader:
         s["synced_status"] = status
 
     def _mark(self, rec: dict, s: dict, status: str, me: str | None = None) -> None:
-        """You replied "sold" / "available" about a watch (me: your message, to reply to)."""
+        """You replied "sold" / "available" / "keep" about a watch (me: your message, to reply to)."""
         title = rec.get("title", rec.get("id"))
         s.pop("asked_at", None)
+        s["confirmed_at"] = time.time()  # you just answered about it: no "still available?" for a while
         s["seen_status"] = rec.get("status")  # the dealer's older status mustn't undo this
         if s["state"] != "uploaded":
             if status == "sold" and s["state"] in ("previewed", "approved"):
@@ -426,8 +427,9 @@ class Uploader:
             elif status == "available":
                 self._send(f"{title} isn't on the website yet. Reply *yes* to its preview to upload it.", reply_to=me)
             return
-        if s.get("synced_status") == status:
-            self._send(f"{title} is already marked {status} on the website.", reply_to=me)
+        if s.get("synced_status") == status or (status == "available" and s.get("synced_status") != "sold"):
+            self._send(f"👍 Keeping {title} on the website." if status == "available"
+                       else f"{title} is already marked sold on the website.", reply_to=me)
             return
         self._set_stock(s, status)
         print(f"  ~ {title}: marked {status} by you")
@@ -442,6 +444,7 @@ class Uploader:
             if not rec or not s:
                 continue
             title = rec["title"]
+            s["confirmed_at"] = time.time()  # the dealer posted it again, so it's still around
             if s["state"] == "uploaded" and rec.get("status") == "sold" and s.get("synced_status") != "sold":
                 continue  # the post itself says sold; the stock sync handles it and tells you
             if s.get("synced_status") == "sold" or (s["state"] != "uploaded" and rec.get("status") == "sold"):
@@ -490,7 +493,7 @@ class Uploader:
             self._about(s, f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
                        f"The website still shows your price, ₹{s['price']:,}.")
 
-    # ------------------------------------------------------------- orders
+    # ------------------------------------------------------------- orders, checks
     def _check_orders(self, catalog: dict[str, dict]) -> None:
         """WhatsApp alert for each new paid / cash-on-delivery order, with a message to forward to the dealer."""
         if time.time() < self.state.get("orders_next", 0):
@@ -536,13 +539,42 @@ class Uploader:
         else:
             self._send("\n".join(lines))
         for s, rec in mine:
-            s["ordered"] = o["id"]
+            s.update(ordered=o["id"], confirmed_at=time.time())
             title = rec.get("title") or s.get("title") or "this watch"
             photos = prepare_images(self.out / rec["folder"], (rec.get("images") or [])[:1]) if rec.get("folder") else []
             dealer = f" (₹{rec['price']:,.0f})" if rec.get("price") else ""
             self._send(f"Hi, is the *{title}*{dealer} still available? I'd like to take it.",
                        photos[0] if photos else None)
         print(f"  🛒 order #{o['number']} ₹{total:,.0f}")
+
+    def _last_seen(self, rec: dict, s: dict) -> float:
+        """When we last knew this watch was still for sale (upload, dealer re-post or update, your answer)."""
+        from datetime import datetime
+        times = [s.get("at", 0), s.get("confirmed_at", 0), s.get("checked_at", 0)]
+        for iso in [rec.get("posted_at"), *[h.get("at") for h in rec.get("history", [])]]:
+            try:
+                times.append(datetime.fromisoformat(iso).timestamp())
+            except (TypeError, ValueError):
+                pass
+        return max(times)
+
+    def _check_stale(self, catalog: dict[str, dict]) -> None:
+        """Watches on sale for a while with no word from the dealer: ask if they're still available."""
+        days = _env_num("WATCHBOT_CHECK_DAYS", 10)
+        hour = time.localtime().tm_hour
+        if days <= 0 or not 10 <= hour < 20:  # daytime only
+            return
+        for pid, s in self.state["products"].items():
+            rec = catalog.get(pid)
+            if (not rec or s["state"] != "uploaded" or s.get("synced_status") == "sold" or s.get("ordered")
+                    or time.time() - self._last_seen(rec, s) < days * 86400):
+                continue
+            age = int((time.time() - s.get("at", time.time())) / 86400)
+            self._about(s, f"⏳ Still available? *{rec['title']}* ₹{s['price']:,}\n"
+                           f"On the website {age} days; the dealer hasn't posted it again.\n"
+                           "Reply to this message: *keep* if it's still for sale, *sold* if it's gone.")
+            s["checked_at"] = time.time()
+            print(f"  ⏳ asked if still available: {rec['title']}")
 
     # ------------------------------------------------------------- loop
     def tick(self) -> None:
@@ -574,11 +606,12 @@ class Uploader:
                 if fails == 1:
                     self._about(s, f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
             self._save()
-        try:
-            self._check_orders(catalog)
-        except Exception as e:  # the site being down mustn't stop uploads
-            print(f"  ! {e}")
-        self._save()
+        for step in (lambda: self._check_orders(catalog), lambda: self._check_stale(catalog)):
+            try:
+                step()
+            except Exception as e:  # the site being down mustn't stop uploads
+                print(f"  ! {e}")
+            self._save()
 
     def run(self, interval: int = 10) -> None:
         if self.woo:

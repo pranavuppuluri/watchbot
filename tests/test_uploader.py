@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -257,6 +258,20 @@ class ApprovalFlowTest(unittest.TestCase):
         self.up.state["orders_next"] = 0
         self.up.tick()                                                    # same order again: no second alert
         self.assertFalse(any("New order" in m["text"] for m in self._sent()))
+
+    def test_still_available_check_and_keep(self):
+        s = self._upload_seiko()
+        s["at"] = time.time() - 11 * 86400
+        noon = time.struct_time((2026, 10, 14, 12, 0, 0, 1, 287, -1))
+        with mock.patch.dict(os.environ, {"WATCHBOT_CHECK_DAYS": "10"}), mock.patch.object(U.time, "localtime", return_value=noon):
+            self.up.tick()
+            check = self._sent()[-1]
+            self.assertIn("Still available?", check["text"])
+            self.up.tick()                                                # asked once, not every tick
+            self.assertEqual(self._sent(), [])
+            self._reply("keep", to_msg=check["id"])
+            self.up.tick()
+            self.assertIn("Keeping Seiko 6309", self._sent()[-1]["text"])
 
     def _sent_texts(self) -> list[str]:
         texts = [json.loads(o.read_text("utf-8"))["text"] for o in sorted((self.out / "_outbox").glob("*.json"),
