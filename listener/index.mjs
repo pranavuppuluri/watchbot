@@ -10,7 +10,7 @@ import makeWASocket, {
   Browsers, DisconnectReason, downloadMediaMessage, getContentType,
   jidNormalizedUser, normalizeMessageContent, useMultiFileAuthState,
 } from '@whiskeysockets/baileys'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pino from 'pino'
@@ -53,11 +53,25 @@ if (existsSync(LOG)) {
 
 // WhatsApp ids of messages we sent, so our own previews aren't read back as replies.
 const sentIds = new Set()
+const outboxToWa = new Map()  // outbox id -> WhatsApp id, so a queued message can reply to an earlier one
 mkdirSync(OUTBOX, { recursive: true })
 if (existsSync(SENT)) {
   for (const line of readFileSync(SENT, 'utf8').split('\n')) {
-    try { sentIds.add(JSON.parse(line).wa_id) } catch {}
+    try {
+      const r = JSON.parse(line)
+      sentIds.add(r.wa_id)
+      outboxToWa.set(r.outbox_id, r.wa_id)
+    } catch {}
   }
+}
+
+// Recent messages in the approval chat (ours and yours), kept so the bot can reply to them.
+const QUOTABLE = join(OUTBOX, 'quotable.json')
+const quotable = new Map(existsSync(QUOTABLE) ? Object.entries(JSON.parse(readFileSync(QUOTABLE, 'utf8') || '{}')) : [])
+function remember(key, text) {
+  quotable.set(key.id, { key, message: { conversation: (text || '').slice(0, 300) } })
+  while (quotable.size > 500) quotable.delete(quotable.keys().next().value)
+  writeFileSync(QUOTABLE, JSON.stringify(Object.fromEntries(quotable)))
 }
 const startedAt = Math.floor(Date.now() / 1000)
 
@@ -167,6 +181,7 @@ function saveApproval(m) {
   if (!text) return
   const rec = { id: m.key.id, ts: Number(m.messageTimestamp) || startedAt, text, quoted_id: quoted, from_me: !!m.key.fromMe }
   appendFileSync(APPROVALS, JSON.stringify(rec) + '\n')
+  remember(m.key, text)
   console.log(`  approval chat: ${text.split('\n')[0].slice(0, 50)}`)
 }
 
@@ -175,7 +190,8 @@ async function sendOutbox(sock, jid) {
   if (sending || !jid) return
   sending = true
   try {
-    const files = readdirSync(OUTBOX).filter(f => f.endsWith('.json')).sort()
+    const files = readdirSync(OUTBOX).filter(f => f.endsWith('.json') && f !== 'quotable.json')
+      .map(f => ({ f, t: statSync(join(OUTBOX, f)).mtimeMs })).sort((a, b) => a.t - b.t).map(x => x.f)  // queue order
     for (const f of files) {
       const path = join(OUTBOX, f)
       let msg
@@ -183,8 +199,13 @@ async function sendOutbox(sock, jid) {
       const content = msg.image && existsSync(msg.image)
         ? { image: readFileSync(msg.image), caption: msg.text }
         : { text: msg.text }
-      const sent = await sock.sendMessage(jid, content)
+      // reply_to: a WhatsApp id, or "out:<outbox id>" for one of our own earlier messages
+      const target = msg.reply_to?.startsWith('out:') ? outboxToWa.get(msg.reply_to.slice(4)) : msg.reply_to
+      const quoted = target && quotable.get(target)
+      const sent = await sock.sendMessage(jid, content, quoted ? { quoted } : {})
       sentIds.add(sent.key.id)
+      outboxToWa.set(msg.id, sent.key.id)
+      remember(sent.key, msg.text)
       appendFileSync(SENT, JSON.stringify({ outbox_id: msg.id, wa_id: sent.key.id, ts: Math.floor(Date.now() / 1000) }) + '\n')
       unlinkSync(path)
       console.log(`  sent: ${msg.text.split('\n').find(l => l.trim() && !l.startsWith('*New')) || ''}`)

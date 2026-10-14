@@ -192,10 +192,11 @@ class Uploader:
         except json.JSONDecodeError:
             return {}  # the saver is mid-write; try again next tick
 
-    def _send(self, text: str, image: Path | None = None) -> str:
-        """Queue a WhatsApp message for the listener. Returns the outbox id."""
+    def _send(self, text: str, image: Path | None = None, reply_to: str | None = None) -> str:
+        """Queue a WhatsApp message for the listener. Returns the outbox id.
+        reply_to: the WhatsApp id of your message to answer, or "out:<outbox id>" for one of ours."""
         oid = uuid.uuid4().hex[:12]
-        msg = {"id": oid, "text": text, "image": str(image) if image else None}
+        msg = {"id": oid, "text": text, "image": str(image) if image else None, "reply_to": reply_to}
         if self.dry_run:
             print(f"    [would send] {text.splitlines()[0]}" + (f"  + {image.name}" if image else ""))
             return oid
