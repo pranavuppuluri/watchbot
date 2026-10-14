@@ -144,10 +144,17 @@ class ApprovalFlowTest(unittest.TestCase):
                 o.unlink()
         return ids
 
-    def _reply(self, text, to_pid=None):
-        quoted = "WA-" + self.up.state["products"][to_pid]["outbox_id"] if to_pid else None
+    def _reply(self, text, to_pid=None, to_msg=None):
+        """Your reply in the approval chat, tagging a watch's preview (to_pid) or one of our messages (to_msg)."""
+        oid = to_msg or (self.up.state["products"][to_pid]["outbox_id"] if to_pid else None)
         with open(self.out / "_inbox" / "approvals.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"id": text, "text": text, "quoted_id": quoted}) + "\n")
+            f.write(json.dumps({"id": "ME-" + text, "text": text, "quoted_id": "WA-" + oid if oid else None}) + "\n")
+
+    def _sent(self) -> list[dict]:
+        msgs = [json.loads(o.read_text("utf-8")) for o in sorted((self.out / "_outbox").glob("*.json"),
+                                                                 key=lambda o: o.stat().st_mtime_ns)]
+        self._deliver_outbox()
+        return msgs
 
     def test_preview_approve_upload_and_sync(self):
         seiko, casio = "20261006-seiko-6309", "20261012-casio-mudmaster"
@@ -158,9 +165,14 @@ class ApprovalFlowTest(unittest.TestCase):
 
         self._reply("yes", seiko)          # no price yet: asks for one
         self._reply("yes 4,200", seiko)
-        self._reply("no")                  # not quoted: the latest preview still waiting (casio)
+        self._reply("no")                  # not tagged: with two watches waiting, it applies to neither
         self.up.tick()
         self.assertEqual(states[seiko]["state"], "uploaded")
+        self.assertEqual(states[casio]["state"], "previewed")
+        asked = [m for m in self._sent() if m["text"].startswith("Which watch?")]
+        self.assertEqual([m["reply_to"] for m in asked], ["ME-no"])   # answers your message
+        self._reply("no", casio)
+        self.up.tick()
         self.assertEqual(states[casio]["state"], "skipped")
         product = self.up.woo.products[states[seiko]["wc_id"]]
         self.assertEqual((product["regular_price"], product["categories"], product["stock_quantity"]),
@@ -199,9 +211,14 @@ class ApprovalFlowTest(unittest.TestCase):
         self.assertIn("Already exists on the website", self._sent_texts()[-1])
         self._deliver_outbox()
 
-        self._reply("Sold")                       # unquoted: the latest "already exists" question
+        self._reply("Sold")                       # not tagged: asks which watch, changes nothing
+        self.up.tick()
+        self.assertEqual(product["stock_quantity"], 1)
+        self.assertTrue(self._sent()[-1]["text"].startswith("Which watch?"))
+        self._reply("Sold", to_msg=s["asked_ids"][-1])   # tagging the "Already exists" message
         self.up.tick()
         self.assertEqual((product["stock_quantity"], product["backorders"]), (0, "no"))
+        self.assertEqual(self._sent()[-1]["reply_to"], "ME-Sold")
         self.up.tick()                            # the dealer's older "available" doesn't undo it
         self.assertEqual(product["stock_quantity"], 0)
         self._reply("available", seiko)

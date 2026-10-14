@@ -161,6 +161,7 @@ class Woo:
         return self._call("PUT", f"wc/v3/products/{wc_id}", json=data)
 
 
+
 class Uploader:
     def __init__(self, out_dir: Path, dry_run: bool = False):
         self.out = Path(out_dir)
@@ -216,6 +217,13 @@ class Uploader:
                 except (json.JSONDecodeError, KeyError):
                     pass
         return out
+
+    def _about(self, s: dict, text: str, image: Path | None = None, reply_to: str | None = None) -> str:
+        """A message about one watch: replies to its preview (unless reply_to says otherwise), and
+        replies to this message count as replies about that watch too."""
+        oid = self._send(text, image, reply_to or (f"out:{s['outbox_id']}" if s.get("outbox_id") else None))
+        s.setdefault("asked_ids", []).append(oid)
+        return oid
 
     def _categories(self) -> dict[str, int]:
         return self.woo.categories() if self.woo else {}
@@ -304,34 +312,35 @@ class Uploader:
         sent = self._sent_ids()
         by_wa = {sent.get(oid): pid for pid, s in self.state["products"].items()
                  for oid in [s.get("outbox_id"), *s.get("asked_ids", [])]}
-        waiting = sorted((s["at"], pid) for pid, s in self.state["products"].items() if s["state"] == "previewed")
         for r in replies:
             text = (r.get("text") or "").strip()
+            me = r.get("id")  # every answer replies to your message
+            # A reply only counts for the watch whose message it tags (or that it names with #id),
+            # so with several watches waiting nothing is ever applied to the wrong one.
             pid = by_wa.get(r.get("quoted_id")) if r.get("quoted_id") else None
-            stock = re.fullmatch(r"(?i)(?:mark\s+(?:as\s+)?)?(sold|available|unsold|in stock)[.!]?", text)
-            if stock:
-                if not pid and not r.get("quoted_id"):  # unquoted: the latest "already exists" question
-                    asked = [(s["asked_at"], p) for p, s in self.state["products"].items() if s.get("asked_at")]
-                    pid = max(asked)[1] if asked else None
-                if pid:
-                    self._mark(catalog.get(pid, {"title": pid}), self.state["products"][pid],
-                               "sold" if stock.group(1).lower() == "sold" else "available")
-                continue
             if not pid:
                 tag = re.search(r"#(\d{8}-[a-z0-9-]+)", text)  # "yes #20261006-seiko-6309" also works
-                pid = tag.group(1) if tag else (waiting[-1][1] if waiting and not r.get("quoted_id") else None)
-            s = self.state["products"].get(pid or "")
-            if not s or s["state"] not in ("previewed", "skipped"):
+                pid = tag.group(1) if tag and tag.group(1) in self.state["products"] else None
+            stock = re.fullmatch(r"(?i)(?:mark\s+(?:as\s+)?)?(sold|available|unsold|in stock)[.!]?", text)
+            if not pid:
+                if stock or parse_reply(text, self._categories())["decision"] or re.fullmatch(r"\d[\d,.]*k?", text):
+                    self._send("Which watch? Reply to (tag) that watch's message, so nothing goes to the wrong one.",
+                               reply_to=me)
                 continue
+            s = self.state["products"][pid]
             rec = catalog.get(pid, {"title": pid})
             title = rec.get("title", pid)
+            if stock:
+                self._mark(rec, s, "sold" if stock.group(1).lower() == "sold" else "available", me)
+                continue
+            if s["state"] not in ("previewed", "skipped"):
+                continue
             reply = parse_reply(text, self._categories())
             if reply["decision"] == "no":
                 s["state"] = "skipped"
                 s.pop("wants_upload", None)
                 print(f"  - skipped: {title}")
-                self._send(f"Skipped: {title}")
-                waiting = [w for w in waiting if w[1] != pid]
+                self._send(f"Skipped: {title}", reply_to=me)
                 continue
             given = {k: reply[k] for k in ("brand", "category", "price") if reply[k] is not None}
             s.update(given)
@@ -344,16 +353,16 @@ class Uploader:
             if not s.get("wants_upload"):  # details without a yes: note them and wait for the yes
                 got = ", ".join(f"{k} {'none' if v == '' else v}" for k, v in given.items())
                 if got or notes:
-                    self._send("\n".join(([f"Noted for {title}: {got}. Reply *yes* to upload."] if got else []) + notes))
+                    self._about(s, "\n".join(([f"Noted for {title}: {got}. Reply *yes* to upload."] if got else [])
+                                             + notes), reply_to=me)
                 continue
             _, _, missing = self._details(rec, s)
             if missing:
-                self._send("\n".join(notes + [self._ask(missing, title)]))
+                self._about(s, "\n".join(notes + [self._ask(missing, title)]), reply_to=me)
                 continue
             s["state"] = "approved"
             s.pop("wants_upload", None)
             print(f"  ✓ approved: {title} ₹{s['price']:,}")
-            waiting = [w for w in waiting if w[1] != pid]
 
     def _upload(self, rec: dict, s: dict) -> None:
         pid, title = rec["id"], rec["title"]
@@ -393,7 +402,7 @@ class Uploader:
                  synced_status=rec.get("status"), dealer_price=rec.get("price"))
         s.pop("error", None)
         print(f"  ↑ uploaded: {title} -> {product.get('permalink')}")
-        self._send(f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
+        self._about(s, f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
 
     def _set_stock(self, s: dict, status: str) -> None:
         # out of stock (and no backorders) = WooCommerce hides Add to cart and refuses checkout
@@ -401,25 +410,25 @@ class Uploader:
                                      "stock_quantity": 0 if status == "sold" else 1})
         s["synced_status"] = status
 
-    def _mark(self, rec: dict, s: dict, status: str) -> None:
-        """You replied "sold" / "available" about a watch."""
+    def _mark(self, rec: dict, s: dict, status: str, me: str | None = None) -> None:
+        """You replied "sold" / "available" about a watch (me: your message, to reply to)."""
         title = rec.get("title", rec.get("id"))
         s.pop("asked_at", None)
         s["seen_status"] = rec.get("status")  # the dealer's older status mustn't undo this
         if s["state"] != "uploaded":
             if status == "sold" and s["state"] in ("previewed", "approved"):
                 s["state"] = "skipped"
-                self._send(f"OK, {title} is sold. It won't be uploaded.")
+                self._send(f"OK, {title} is sold. It won't be uploaded.", reply_to=me)
             elif status == "available":
-                self._send(f"{title} isn't on the website yet. Reply *yes* to its preview to upload it.")
+                self._send(f"{title} isn't on the website yet. Reply *yes* to its preview to upload it.", reply_to=me)
             return
         if s.get("synced_status") == status:
-            self._send(f"{title} is already marked {status} on the website.")
+            self._send(f"{title} is already marked {status} on the website.", reply_to=me)
             return
         self._set_stock(s, status)
         print(f"  ~ {title}: marked {status} by you")
         self._send(f"✅ {title} marked sold. It can't be added to cart or bought now." if status == "sold"
-                   else f"✅ {title} is back in stock on the website.")
+                   else f"✅ {title} is back in stock on the website.", reply_to=me)
 
     def _ask_reposts(self, catalog: dict[str, dict]) -> None:
         """A watch was posted again: say it already exists and offer to mark it sold."""
@@ -432,7 +441,7 @@ class Uploader:
             if s["state"] == "uploaded" and rec.get("status") == "sold" and s.get("synced_status") != "sold":
                 continue  # the post itself says sold; the stock sync handles it and tells you
             if s.get("synced_status") == "sold" or (s["state"] != "uploaded" and rec.get("status") == "sold"):
-                self._send(f"♻ Already exists: {title}. It's already marked sold.")
+                self._about(s, f"♻ Already exists: {title}. It's already marked sold.")
                 continue
             if s["state"] == "uploaded":
                 text = (f"♻ Already exists on the website: *{title}*\n₹{s['price']:,}\n{s.get('url') or ''}\n\n"
@@ -441,7 +450,7 @@ class Uploader:
                 text = f"♻ Already exists: *{title}*. You skipped it earlier. Reply *sold* if it's sold."
             else:
                 text = f"♻ Already exists: *{title}*. It's waiting for your *yes*. Reply *sold* if it's sold."
-            s.setdefault("asked_ids", []).append(self._send(text))
+            self._about(s, text)
             s["asked_at"] = time.time()
             print(f"  ♻ already exists: {title}")
 
@@ -455,7 +464,7 @@ class Uploader:
         self._set_stock(s, status)
         word = "marked sold (out of stock)" if status == "sold" else "back in stock"
         print(f"  ~ {rec['title']}: {word}")
-        self._send(f"{rec['title']} {word} on the website.")
+        self._about(s, f"{rec['title']} {word} on the website (dealer's post).")
 
     def _sync_price(self, rec: dict, s: dict) -> None:
         """Dealer re-posted or replied with a new price: follow it, unless you set the price yourself."""
@@ -472,9 +481,9 @@ class Uploader:
             self.woo.update(s["wc_id"], {"regular_price": str(new)})
             s["price"] = new
             print(f"  ~ {rec['title']}: price {old} -> {new}")
-            self._send(f"Price updated on the website: {rec['title']}\n₹{old:,} → ₹{new:,} (dealer changed it)")
+            self._about(s, f"Price updated on the website: {rec['title']}\n₹{old:,} → ₹{new:,} (dealer changed it)")
         else:
-            self._send(f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
+            self._about(s, f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
                        f"The website still shows your price, ₹{s['price']:,}.")
 
     # ------------------------------------------------------------- loop
@@ -505,7 +514,7 @@ class Uploader:
                 s.update(error=str(e)[:300], fails=fails, retry_at=time.time() + min(60 * 2 ** fails, 3600))
                 print(f"  ! {rec['title']}: {e}")
                 if fails == 1:
-                    self._send(f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
+                    self._about(s, f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
             self._save()
 
     def run(self, interval: int = 10) -> None:
