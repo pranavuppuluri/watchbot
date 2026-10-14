@@ -273,6 +273,17 @@ class ApprovalFlowTest(unittest.TestCase):
             self.up.tick()
             self.assertIn("Keeping Seiko 6309", self._sent()[-1]["text"])
 
+    def test_daily_summary_once_a_day(self):
+        self._upload_seiko()
+        evening = time.struct_time((2026, 10, 14, 21, 5, 0, 1, 287, -1))
+        with mock.patch.object(U.time, "localtime", return_value=evening):
+            self.up.tick()
+            summary = [m for m in self._sent() if m["text"].startswith("📋")]
+            self.assertEqual(len(summary), 1)
+            self.assertIn("Uploaded: 1", summary[0]["text"])
+            self.up.tick()
+            self.assertFalse(any(m["text"].startswith("📋") for m in self._sent()))
+
     def _sent_texts(self) -> list[str]:
         texts = [json.loads(o.read_text("utf-8"))["text"] for o in sorted((self.out / "_outbox").glob("*.json"),
                                                                           key=lambda o: o.stat().st_mtime_ns)]

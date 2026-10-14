@@ -229,6 +229,12 @@ class Uploader:
         s.setdefault("asked_ids", []).append(oid)
         return oid
 
+    def _event(self, kind: str, title: str, amount: float | None = None) -> None:
+        """Remembered for the daily summary (kept 3 days)."""
+        events = [e for e in self.state.get("events", []) if e["t"] > time.time() - 3 * 86400]
+        events.append({"t": time.time(), "kind": kind, "title": title, "amount": amount})
+        self.state["events"] = events
+
     def _categories(self) -> dict[str, int]:
         return self.woo.categories() if self.woo else {}
 
@@ -287,6 +293,7 @@ class Uploader:
         lines += ["", "Reply to this message: *yes* to upload, *yes 4500* to set the price, *no* to skip.", f"#{pid}"]
         oid = self._send("\n".join(lines), photos[0] if photos else None)
         self.state["products"][pid] = {"state": "previewed", "outbox_id": oid, "price": price, "at": time.time()}
+        self._event("new", rec["title"], price)
         print(f"  ? preview sent: {rec['title']}" + (f" ₹{price:,}" if price else " (no price)"))
 
     def _read_approvals(self) -> list[dict]:
@@ -406,6 +413,7 @@ class Uploader:
                  synced_status=rec.get("status"), dealer_price=rec.get("price"))
         s.pop("error", None)
         print(f"  ↑ uploaded: {title} -> {product.get('permalink')}")
+        self._event("uploaded", title, s["price"])
         self._about(s, f"✅ Uploaded: {title}\n₹{s['price']:,}\n{product.get('permalink')}")
 
     def _set_stock(self, s: dict, status: str) -> None:
@@ -413,10 +421,13 @@ class Uploader:
         self.woo.update(s["wc_id"], {"manage_stock": True, "backorders": "no",
                                      "stock_quantity": 0 if status == "sold" else 1})
         s["synced_status"] = status
+        if status == "sold":
+            self._event("sold", s.get("title") or "", s.get("price"))
 
     def _mark(self, rec: dict, s: dict, status: str, me: str | None = None) -> None:
         """You replied "sold" / "available" / "keep" about a watch (me: your message, to reply to)."""
         title = rec.get("title", rec.get("id"))
+        s["title"] = title
         s.pop("asked_at", None)
         s["confirmed_at"] = time.time()  # you just answered about it: no "still available?" for a while
         s["seen_status"] = rec.get("status")  # the dealer's older status mustn't undo this
@@ -468,6 +479,7 @@ class Uploader:
         s["seen_status"] = status
         if status == s.get("synced_status") or status not in ("sold", "available"):
             return
+        s["title"] = rec["title"]
         self._set_stock(s, status)
         word = "marked sold (out of stock)" if status == "sold" else "back in stock"
         print(f"  ~ {rec['title']}: {word}")
@@ -493,7 +505,7 @@ class Uploader:
             self._about(s, f"Dealer changed the price of {rec['title']} to ₹{dealer:,.0f}. "
                        f"The website still shows your price, ₹{s['price']:,}.")
 
-    # ------------------------------------------------------------- orders, checks
+    # ------------------------------------------------------------- orders, checks, summary
     def _check_orders(self, catalog: dict[str, dict]) -> None:
         """WhatsApp alert for each new paid / cash-on-delivery order, with a message to forward to the dealer."""
         if time.time() < self.state.get("orders_next", 0):
@@ -545,6 +557,7 @@ class Uploader:
             dealer = f" (₹{rec['price']:,.0f})" if rec.get("price") else ""
             self._send(f"Hi, is the *{title}*{dealer} still available? I'd like to take it.",
                        photos[0] if photos else None)
+        self._event("order", ", ".join(i["name"] for i in o["line_items"]), total)
         print(f"  🛒 order #{o['number']} ₹{total:,.0f}")
 
     def _last_seen(self, rec: dict, s: dict) -> float:
@@ -576,6 +589,38 @@ class Uploader:
             s["checked_at"] = time.time()
             print(f"  ⏳ asked if still available: {rec['title']}")
 
+    def _summary(self) -> None:
+        """One message each evening (WATCHBOT_SUMMARY_AT, default 21:00) with the day's numbers."""
+        at = os.environ.get("WATCHBOT_SUMMARY_AT", "21:00").strip()
+        if at.lower() in ("", "off", "no"):
+            return
+        h, m = (int(x) for x in (at.split(":") + ["0"])[:2])
+        now = time.localtime()
+        today = time.strftime("%Y-%m-%d", now)
+        if (now.tm_hour, now.tm_min) < (h, m) or self.state.get("summary_day") == today:
+            return
+        since = self.state.get("summary_at", time.time() - 86400)
+        ev = [e for e in self.state.get("events", []) if e["t"] > since]
+        count = lambda k: [e for e in ev if e["kind"] == k]
+        products = self.state["products"].values()
+        waiting = [s for s in products if s["state"] == "previewed"]
+        unanswered = [s for s in products if s.get("checked_at", 0) > s.get("confirmed_at", 0)
+                      and s["state"] == "uploaded" and s.get("synced_status") != "sold"]
+        orders = count("order")
+        lines = [f"📋 *Today* ({time.strftime('%d %b', now)})",
+                 f"New watches: {len(count('new'))}",
+                 f"Uploaded: {len(count('uploaded'))}",
+                 f"Sold: {len(count('sold'))}",
+                 f"Orders: {len(orders)}" + (f" (₹{sum(e['amount'] or 0 for e in orders):,.0f})" if orders else "")]
+        if waiting:
+            lines.append(f"Waiting for your yes: {len(waiting)}")
+        if unanswered:
+            lines.append(f"\"Still available?\" not answered: {len(unanswered)}")
+        on_sale = sum(1 for s in products if s["state"] == "uploaded" and s.get("synced_status") != "sold")
+        lines.append(f"On the website now: {on_sale}")
+        self._send("\n".join(lines))
+        self.state.update(summary_day=today, summary_at=time.time())
+
     # ------------------------------------------------------------- loop
     def tick(self) -> None:
         catalog = self._catalog()
@@ -606,7 +651,7 @@ class Uploader:
                 if fails == 1:
                     self._about(s, f"⚠ Upload failed for {rec['title']}: {str(e)[:200]}\nI'll keep retrying.")
             self._save()
-        for step in (lambda: self._check_orders(catalog), lambda: self._check_stale(catalog)):
+        for step in (lambda: self._check_orders(catalog), lambda: self._check_stale(catalog), self._summary):
             try:
                 step()
             except Exception as e:  # the site being down mustn't stop uploads
