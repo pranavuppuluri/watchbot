@@ -117,6 +117,11 @@ def cmd_serve(args) -> None:
 
 
 def main() -> None:
+    # Dealer text and prices carry ₹ and emoji. A Windows console or a redirected log
+    # can be cp1252, where printing them raises; show a "?" instead of stopping.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(prog="watchbot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 

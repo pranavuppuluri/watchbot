@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -14,6 +15,13 @@ from PIL import Image
 from watchbot import uploader as U
 from watchbot.details import category_for, find_brand, normalise_brand, parse_reply
 from watchbot.extract import extract_with_rules, parse_price
+
+
+def setUpModule():
+    # The uploader prints prices with ₹, as `python -m watchbot` allows for in main().
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
 
 
 class RulesTest(unittest.TestCase):
