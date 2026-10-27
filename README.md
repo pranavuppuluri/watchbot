@@ -72,7 +72,7 @@ cd listener && npm install          # only for the live listener (Node 20+)
 
 Optional: put `ANTHROPIC_API_KEY=...` in a `.env` file for AI extraction. Without it, the basic rules are used.
 
-Tests: `python -m unittest discover tests` (listing rules, photo resizing, and the preview → yes → upload → sold flow against a fake shop).
+Tests: `python -m unittest discover tests` (Android and iPhone exports, grouping photos into watches, listing rules, photo resizing, and the preview → yes → upload → sold flow against a fake shop). They run on Ubuntu and Windows for every push.
 
 ## Use
 
