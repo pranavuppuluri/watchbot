@@ -92,7 +92,7 @@ def closest(word: str, choices, strict: bool = False):
     allowed = 0 if len(k) <= 3 else 1 if len(k) <= 6 or strict else 2
     if strict and len(k) < 6:
         allowed = 0
-    if not allowed:
+    if not allowed or not by_key:  # no choices: a shop with no categories, or none connected
         return None
     scored = sorted((edits(k, c), c) for c in by_key)
     best = [c for d, c in scored if d == scored[0][0]]

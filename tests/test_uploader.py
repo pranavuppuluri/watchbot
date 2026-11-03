@@ -90,6 +90,13 @@ class DetailsTest(unittest.TestCase):
         self.assertEqual((category_for("Omega", CATS), category_for("Raketa", CATS), category_for("titan", CATS)),
                          ("Swiss", "USSR", "Titan"))
 
+    def test_no_categories_on_the_shop(self):
+        self.assertEqual(normalise_brand("omga", {}), "Omega")
+        self.assertIsNone(category_for("Omega", {}))
+        r = parse_reply("yes brand omga category swis 4500", {})
+        self.assertEqual((r["decision"], r["brand"], r["category"], r["price"], r["unknown"]),
+                         ("yes", "Omega", None, 4500, ["swis"]))
+
 
 class FakeWoo:
     base = "https://shop.test"
